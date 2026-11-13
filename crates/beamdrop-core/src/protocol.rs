@@ -45,6 +45,9 @@ pub enum MessageType {
     Complete = 0x07,
     PairRequest = 0x08,
     PairConfirm = 0x09,
+    Pause = 0x0A,
+    Cancel = 0x0B,
+    Resume = 0x0C,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -61,6 +64,9 @@ impl TryFrom<u8> for MessageType {
             0x07 => Ok(Self::Complete),
             0x08 => Ok(Self::PairRequest),
             0x09 => Ok(Self::PairConfirm),
+            0x0A => Ok(Self::Pause),
+            0x0B => Ok(Self::Cancel),
+            0x0C => Ok(Self::Resume),
             other => Err(ProtocolError::UnknownMessageType(other)),
         }
     }
@@ -95,6 +101,9 @@ pub struct OfferPayload {
     pub sender_name: String,
     pub files: Vec<FileOfferEntry>,
     pub total_bytes: u64,
+    /// When `true`, chunks on unidirectional data streams carry `[12B nonce][ChaCha20-Poly1305 ciphertext+tag]`.
+    #[serde(default)]
+    pub wan_encrypted: bool,
 }
 
 /// Contiguous range `[start, end)` of 128 KiB chunk indices.
@@ -176,6 +185,13 @@ pub struct PairConfirmPayload {
     pub reason: Option<String>,
 }
 
+/// Bidirectional transfer lifecycle control frame (`Pause`, `Cancel`, `Resume`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferControlPayload {
+    pub transfer_id: Uuid,
+    pub reason: Option<String>,
+}
+
 /// Derives the deterministic 64-bit `transfer_id` used in 24-byte unidirectional chunk headers
 /// from a 128-bit transfer `Uuid`.
 pub fn transfer_stream_id(transfer_id: Uuid) -> u64 {
@@ -202,6 +218,9 @@ pub enum Message {
     Complete(CompletePayload),
     PairRequest(PairRequestPayload),
     PairConfirm(PairConfirmPayload),
+    Pause(TransferControlPayload),
+    Cancel(TransferControlPayload),
+    Resume(TransferControlPayload),
 }
 
 impl Message {
@@ -217,6 +236,9 @@ impl Message {
             Self::Complete(_) => MessageType::Complete,
             Self::PairRequest(_) => MessageType::PairRequest,
             Self::PairConfirm(_) => MessageType::PairConfirm,
+            Self::Pause(_) => MessageType::Pause,
+            Self::Cancel(_) => MessageType::Cancel,
+            Self::Resume(_) => MessageType::Resume,
         }
     }
 
@@ -232,6 +254,7 @@ impl Message {
             Self::Complete(p) => bincode::serialize(p)?,
             Self::PairRequest(p) => bincode::serialize(p)?,
             Self::PairConfirm(p) => bincode::serialize(p)?,
+            Self::Pause(p) | Self::Cancel(p) | Self::Resume(p) => bincode::serialize(p)?,
         };
         Ok(payload)
     }
@@ -248,6 +271,9 @@ impl Message {
             MessageType::Complete => Self::Complete(bincode::deserialize(payload)?),
             MessageType::PairRequest => Self::PairRequest(bincode::deserialize(payload)?),
             MessageType::PairConfirm => Self::PairConfirm(bincode::deserialize(payload)?),
+            MessageType::Pause => Self::Pause(bincode::deserialize(payload)?),
+            MessageType::Cancel => Self::Cancel(bincode::deserialize(payload)?),
+            MessageType::Resume => Self::Resume(bincode::deserialize(payload)?),
         };
         Ok(msg)
     }
@@ -361,6 +387,7 @@ mod tests {
                     head_blake3: Some([0xcd; 32]),
                 }],
                 total_bytes: 1024 * 512,
+                wan_encrypted: false,
             }),
             Message::Accept(AcceptPayload {
                 transfer_id,
@@ -402,6 +429,18 @@ mod tests {
                 responder_node_id: id.node_id,
                 display_name: id.hostname.clone(),
                 os_type: id.os_type,
+                reason: None,
+            }),
+            Message::Pause(TransferControlPayload {
+                transfer_id,
+                reason: Some("Paused by user".to_string()),
+            }),
+            Message::Cancel(TransferControlPayload {
+                transfer_id,
+                reason: Some("Cancelled by user".to_string()),
+            }),
+            Message::Resume(TransferControlPayload {
+                transfer_id,
                 reason: None,
             }),
         ];

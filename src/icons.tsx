@@ -121,3 +121,30 @@ export const ChevronIcon = (p: IconProps) => (
     <path d="m6 15 6-6 6 6" />
   </Svg>
 );
+
+export const PauseIcon = (p: IconProps) => (
+  <Svg size={14} {...p}>
+    <rect x="6" y="5" width="4" height="14" rx="1" />
+    <rect x="14" y="5" width="4" height="14" rx="1" />
+  </Svg>
+);
+
+export const PlayIcon = (p: IconProps) => (
+  <Svg size={14} {...p}>
+    <path d="M7 5.5v13l11-6.5Z" />
+  </Svg>
+);
+
+export const RefreshIcon = (p: IconProps) => (
+  <Svg size={14} {...p}>
+    <path d="M20 11a8 8 0 0 0-14.5-4.5M4 4v4.5h4.5M4 13a8 8 0 0 0 14.5 4.5M20 20v-4.5h-4.5" />
+  </Svg>
+);
+
+export const GlobeIcon = (p: IconProps) => (
+  <Svg size={14} {...p}>
+    <circle cx="12" cy="12" r="9" />
+    <ellipse cx="12" cy="12" rx="3.8" ry="9" />
+    <path d="M3.5 12h17" />
+  </Svg>
+);

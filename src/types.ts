@@ -17,6 +17,7 @@ export interface PeerEntry {
   online: boolean;
   paired: boolean;
   autoAccept: boolean;
+  allowWan: boolean;
   pairedAtUnix: number | null;
   lastSeenUnixMs: number | null;
 }
@@ -35,6 +36,12 @@ export interface TrustedPeer {
   osType: string;
   pairedAtUnix: number;
   autoAccept: boolean;
+  allowWan: boolean;
+}
+
+export interface MeasurePathsResult {
+  resolvedPaths: string[];
+  totalBytes: number;
 }
 
 export interface TransferRecord {
@@ -76,5 +83,16 @@ export interface FirewallStatus {
 export interface SendDispatchResult {
   queued: number;
   targetNodeId: string;
+}
+
+export interface TargetedSendRequest {
+  targetNodeId: string;
+  paths: string[];
+}
+
+export interface ParsedPairingUri {
+  nodeId: string;
+  addr: string | null;
+  pin: string;
 }
 

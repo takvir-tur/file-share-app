@@ -288,6 +288,20 @@ async fn run_daemon(
                             output_dir.map(|d| d.display().to_string()).unwrap_or_default()
                         );
                     }
+                    Ok(TransferEvent::Started { transfer_id, files, total_bytes, .. }) => {
+                        println!(
+                            "[TRANSFER STARTED] {} | {} file(s) ({:.2} MB)",
+                            transfer_id,
+                            files,
+                            total_bytes as f64 / (1024.0 * 1024.0)
+                        );
+                    }
+                    Ok(TransferEvent::Paused { transfer_id, reason }) => {
+                        println!("[TRANSFER PAUSED] {} | {}", transfer_id, reason.unwrap_or_default());
+                    }
+                    Ok(TransferEvent::Cancelled { transfer_id, reason }) => {
+                        println!("[TRANSFER CANCELLED] {} | {}", transfer_id, reason.unwrap_or_default());
+                    }
                     Ok(TransferEvent::Interrupted { transfer_id, reason }) => {
                         println!("[TRANSFER INTERRUPTED] {} | {}", transfer_id, reason);
                     }

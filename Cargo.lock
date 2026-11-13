@@ -477,6 +477,8 @@ dependencies = [
  "bincode",
  "blake3",
  "bytes",
+ "chacha20poly1305",
+ "curve25519-dalek",
  "directories",
  "ed25519-dalek",
  "iroh",
@@ -788,6 +790,19 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "chacha20poly1305"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
+dependencies = [
+ "aead",
+ "chacha20 0.9.1",
+ "cipher",
+ "poly1305",
+ "zeroize",
 ]
 
 [[package]]

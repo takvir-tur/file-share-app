@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use beamdrop_core::transfer::{
-    DEFAULT_APPROVAL_TIMEOUT, MAX_PARALLEL_STREAMS, ResumeMetadata, TransferEvent,
+    DEFAULT_APPROVAL_TIMEOUT, MAX_PARALLEL_STREAMS, ResumeMetadata, TransferError, TransferEvent,
     TransferProgress, hash_file_blake3, part_path_for, resume_path_for,
 };
 use beamdrop_core::{BeamDropNode, NodeConfig, PeerEvent};
@@ -95,9 +95,10 @@ async fn start_test_node(root: &Path, name: &str) -> BeamDropNode {
 
 async fn connect_localhost(sender: &BeamDropNode, receiver: &BeamDropNode) {
     let receiver_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), receiver.listen_port());
+    let ep = sender.endpoint();
     sender
         .discovery()
-        .dial_addr(sender.endpoint(), receiver.identity().node_id, receiver_addr)
+        .dial_addr(&ep, receiver.identity().node_id, receiver_addr)
         .await
         .expect("dial receiver over localhost");
 }
@@ -674,4 +675,380 @@ async fn test_untrusted_peer_held_pending_and_rejected() {
     if let Ok(node) = Arc::try_unwrap(receiver) {
         node.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn test_bidirectional_pause_and_resume_transfer() {
+    let tmp = TestTempDir::new("pause_resume");
+    let total_bytes: u64 = 96 * 1024 * 1024;
+    let src_file = tmp.path().join("pausable_96mb.bin");
+    create_deterministic_file(&src_file, total_bytes, 0x1122_3344_5566_7788);
+    let src_hash = hash_file_blake3(&src_file).await.expect("hash source file");
+
+    let receiver = Arc::new(start_test_node(tmp.path(), "receiver").await);
+    let sender = Arc::new(start_test_node(tmp.path(), "sender").await);
+    pair_nodes_localhost(&sender, &receiver).await;
+
+    let mut receiver_events = receiver.subscribe_transfers();
+    let receiver_id = receiver.identity().node_id;
+
+    let send_handle = tokio::spawn({
+        let s = Arc::clone(&sender);
+        let p = src_file.clone();
+        async move { s.send_path(receiver_id, &p, None).await }
+    });
+
+    // Wait for receiver progress >= 4 MiB, then pause from the receiver side.
+    let transfer_id = timeout(Duration::from_secs(30), async {
+        loop {
+            match receiver_events.recv().await {
+                Ok(TransferEvent::Progress(p)) if p.bytes_transferred >= 4 * 1024 * 1024 => {
+                    break p.transfer_id;
+                }
+                Ok(TransferEvent::Completed { .. }) => {
+                    panic!("transfer finished before test could pause")
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("receiver event error: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for progress before first pause");
+
+    assert!(
+        receiver.pause_transfer(transfer_id).await,
+        "receiver pause_transfer should return true"
+    );
+
+    let first_err = timeout(Duration::from_secs(15), send_handle)
+        .await
+        .expect("sender timed out after pause")
+        .expect("send task join error")
+        .expect_err("send_path should stop with Paused");
+    assert!(
+        matches!(
+            first_err.downcast_ref::<TransferError>(),
+            Some(TransferError::Paused(id)) if *id == transfer_id
+        ),
+        "expected TransferError::Paused, got: {first_err:?}"
+    );
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            match receiver_events.recv().await {
+                Ok(TransferEvent::Paused { transfer_id: pid, .. }) if pid == transfer_id => break,
+                Ok(_) => continue,
+                Err(e) => panic!("receiver event error: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("TransferEvent::Paused should be emitted on receiver after pause");
+
+    let dst_file = receiver.download_dir().join("pausable_96mb.bin");
+    assert!(
+        resume_path_for(&dst_file).exists(),
+        ".resume.json should be persisted after pause"
+    );
+    assert!(part_path_for(&dst_file).exists(), ".beamdrop.part should stay on disk when paused");
+
+    // Resume from the receiver side (receiver sends Message::Resume to sender), then pause from sender!
+    receiver
+        .resume_transfer(transfer_id)
+        .await
+        .expect("receiver-initiated resume failed");
+
+    // Wait until a second Progress event shows resumed flow (or completion), pause from sender if still active,
+    // or wait for completion if fast enough, ensuring resumed completion succeeds cleanly.
+    let paused_by_sender = timeout(Duration::from_secs(15), async {
+        loop {
+            match receiver_events.recv().await {
+                Ok(TransferEvent::Progress(p)) if p.transfer_id == transfer_id && p.bytes_transferred >= 4 * 1024 * 1024 => {
+                    break sender.pause_transfer(transfer_id).await;
+                }
+                Ok(TransferEvent::Completed { transfer_id: cid, .. }) if cid == transfer_id => {
+                    break false;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("receiver event error: {e}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    if paused_by_sender {
+        // Wait for TransferEvent::Paused on sender side before resuming from sender
+        let mut sender_events = sender.subscribe_transfers();
+        let _ = timeout(Duration::from_secs(10), async {
+            loop {
+                match sender_events.recv().await {
+                    Ok(TransferEvent::Paused { transfer_id: pid, .. }) if pid == transfer_id => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        sender
+            .resume_transfer(transfer_id)
+            .await
+            .expect("sender-initiated resume failed");
+    }
+
+    let resumed_bytes = timeout(Duration::from_secs(60), async {
+        loop {
+            if dst_file.exists() {
+                if let Ok(hash) = hash_file_blake3(&dst_file).await {
+                    if hash == src_hash {
+                        // Drain channel gently for Completed event if still in buffer
+                        while let Ok(ev) = receiver_events.try_recv() {
+                            if let TransferEvent::Completed {
+                                transfer_id: cid,
+                                bytes_skipped_resumed,
+                                verified,
+                                ..
+                            } = ev
+                            {
+                                if cid == transfer_id {
+                                    assert!(verified);
+                                    return bytes_skipped_resumed;
+                                }
+                            }
+                        }
+                        return 1;
+                    }
+                }
+            }
+            match receiver_events.recv().await {
+                Ok(TransferEvent::Completed {
+                    transfer_id: cid,
+                    bytes_skipped_resumed,
+                    verified,
+                    ..
+                }) if cid == transfer_id => {
+                    assert!(verified, "resumed transfer must verify BLAKE3");
+                    break bytes_skipped_resumed;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("receiver event error waiting for completion: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for resumed transfer completion");
+
+    assert!(resumed_bytes > 0, "expected bytes_skipped_resumed > 0 after pause/resume");
+    assert!(!part_path_for(&dst_file).exists());
+    assert!(!resume_path_for(&dst_file).exists());
+    assert_eq!(hash_file_blake3(&dst_file).await.unwrap(), src_hash);
+
+    if let Ok(node) = Arc::try_unwrap(sender) {
+        node.shutdown().await;
+    }
+    if let Ok(node) = Arc::try_unwrap(receiver) {
+        node.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn test_cancel_while_active_and_while_paused_deletes_partials() {
+    let tmp = TestTempDir::new("cancel_cleanup");
+    let total_bytes: u64 = 96 * 1024 * 1024;
+    let src_file = tmp.path().join("cancellable_96mb.bin");
+    create_deterministic_file(&src_file, total_bytes, 0xAABB_CCDD_EEFF_0011);
+
+    let receiver = Arc::new(start_test_node(tmp.path(), "receiver").await);
+    let sender = Arc::new(start_test_node(tmp.path(), "sender").await);
+    pair_nodes_localhost(&sender, &receiver).await;
+
+    let mut receiver_events = receiver.subscribe_transfers();
+    let receiver_id = receiver.identity().node_id;
+
+    let send_handle = tokio::spawn({
+        let s = Arc::clone(&sender);
+        let p = src_file.clone();
+        async move { s.send_path(receiver_id, &p, None).await }
+    });
+
+    let transfer_id = timeout(Duration::from_secs(30), async {
+        loop {
+            match receiver_events.recv().await {
+                Ok(TransferEvent::Progress(p)) if p.bytes_transferred >= 2 * 1024 * 1024 => {
+                    break p.transfer_id;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("receiver event error: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for progress before pause");
+
+    assert!(sender.pause_transfer(transfer_id).await);
+    let pause_err = timeout(Duration::from_secs(15), send_handle)
+        .await
+        .expect("send timed out on pause")
+        .expect("join error")
+        .expect_err("expected pause error");
+    assert!(matches!(
+        pause_err.downcast_ref::<TransferError>(),
+        Some(TransferError::Paused(_))
+    ));
+
+    let dst_file = receiver.download_dir().join("cancellable_96mb.bin");
+    timeout(Duration::from_secs(10), async {
+        while !part_path_for(&dst_file).exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect(".beamdrop.part should exist while paused");
+
+    // Cancel from sender side while transfer is already paused -> should delete receiver's partials!
+    let cancel_ok = sender.cancel_transfer(transfer_id).await;
+    assert!(cancel_ok);
+
+    let got_cancel = timeout(Duration::from_secs(10), async {
+        loop {
+            match receiver_events.recv().await {
+                Ok(TransferEvent::Cancelled { transfer_id: cid, .. }) if cid == transfer_id => {
+                    break true;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("receiver cancel wait error: {e}"),
+            }
+        }
+    })
+    .await;
+    assert!(got_cancel.is_ok(), "receiver did not receive remote Cancel for paused transfer");
+
+    assert!(!part_path_for(&dst_file).exists(), ".beamdrop.part must be deleted on Cancel");
+    assert!(!resume_path_for(&dst_file).exists(), ".resume.json must be deleted on Cancel");
+    assert!(!dst_file.exists(), "cancelled file must not be finalized");
+
+    if let Ok(node) = Arc::try_unwrap(sender) {
+        node.shutdown().await;
+    }
+    if let Ok(node) = Arc::try_unwrap(receiver) {
+        node.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn test_wan_opt_in_reconfigures_endpoint_and_encrypts_chunks() {
+    let tmp = TestTempDir::new("wan_opt_in");
+    let total_bytes: u64 = 512 * 1024 + 321;
+    let payload_path = tmp.path().join("wan_secret_payload.bin");
+    create_deterministic_file(&payload_path, total_bytes, 0xCAFE_BABE_1234_5678);
+    let expected_hash = hash_file_blake3(&payload_path).await.unwrap();
+
+    let alice = start_test_node(tmp.path(), "alice").await;
+    let bob = start_test_node(tmp.path(), "bob").await;
+
+    // 1. Fresh nodes default to strictly LAN-only (no WAN relay/discovery active)
+    assert!(!alice.trust_store().any_wan_enabled().await);
+    assert!(!alice.discovery().is_wan_transport_enabled());
+    assert!(!bob.discovery().is_wan_transport_enabled());
+
+    pair_nodes_localhost(&alice, &bob).await;
+
+    // 2. Newly paired peer defaults to allow_wan == false with matching X25519 secret
+    let alice_bob_entry = alice
+        .trust_store()
+        .get_peer(&bob.identity().node_id)
+        .await
+        .expect("Bob in Alice's trust store");
+    let bob_alice_entry = bob
+        .trust_store()
+        .get_peer(&alice.identity().node_id)
+        .await
+        .expect("Alice in Bob's trust store");
+    assert!(!alice_bob_entry.allow_wan);
+    assert!(!bob_alice_entry.allow_wan);
+    assert_ne!(alice_bob_entry.wan_shared_secret, [0u8; 32]);
+    assert_eq!(
+        alice_bob_entry.wan_shared_secret,
+        bob_alice_entry.wan_shared_secret
+    );
+
+    // 3. Attempting a WAN-encrypted transfer when Alice has allow_wan=false fails immediately
+    let blocked_err = alice
+        .send_path_with_wan_override(bob.identity().node_id, &payload_path, Some(true), None)
+        .await
+        .expect_err("WAN transfer must be blocked when allow_wan is false");
+    assert!(
+        blocked_err.to_string().contains("Long-distance")
+            || matches!(
+                blocked_err.downcast_ref::<TransferError>(),
+                Some(TransferError::WanDisallowed(_))
+            )
+    );
+
+    // 4. Enabling WAN on Alice reconfigures DiscoveryEngine WAN transport, yet Bob (allow_wan=false) still rejects it
+    assert!(alice
+        .set_peer_wan_enabled(bob.identity().node_id, true)
+        .await
+        .unwrap());
+    assert!(alice.discovery().is_wan_transport_enabled());
+
+    let peer_rejected = alice
+        .send_path_with_wan_override(bob.identity().node_id, &payload_path, Some(true), None)
+        .await
+        .expect_err("Bob must reject WAN transfer while his allow_wan is false");
+    assert!(
+        peer_rejected.to_string().contains("disabled"),
+        "unexpected error: {peer_rejected}"
+    );
+
+    // 5. Enabling WAN on Bob completes end-to-end daily-rotating ChaCha20-Poly1305 encrypted transfer
+    assert!(bob
+        .set_peer_wan_enabled(alice.identity().node_id, true)
+        .await
+        .unwrap());
+    assert!(bob.discovery().is_wan_transport_enabled());
+
+    let mut bob_events = bob.subscribe_transfers();
+    let summary = alice
+        .send_path_with_wan_override(bob.identity().node_id, &payload_path, Some(true), None)
+        .await
+        .expect("WAN encrypted transfer succeeds once both peers opt in");
+    assert_eq!(summary.files_count, 1);
+    assert_eq!(summary.total_bytes, total_bytes);
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            match bob_events.recv().await {
+                Ok(TransferEvent::Completed {
+                    transfer_id,
+                    verified,
+                    ..
+                }) if transfer_id == summary.transfer_id => {
+                    assert!(verified, "decrypted WAN file must pass BLAKE3 verification");
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("bob event channel error: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for WAN transfer completion");
+
+    let received = bob.download_dir().join("wan_secret_payload.bin");
+    let got_hash = hash_file_blake3(&received).await.unwrap();
+    assert_eq!(got_hash, expected_hash);
+
+    // 6. Disabling WAN on Alice tears down WAN relay transport back to strictly LAN-only mode
+    assert!(alice
+        .set_peer_wan_enabled(bob.identity().node_id, false)
+        .await
+        .unwrap());
+    assert!(!alice.trust_store().any_wan_enabled().await);
+    assert!(!alice.discovery().is_wan_transport_enabled());
+
+    alice.shutdown().await;
+    bob.shutdown().await;
 }

@@ -4,7 +4,10 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use beamdrop_core::{BeamDropNode, PeerEvent, PeerInfo, TransferEvent, TrustedPeer};
+use beamdrop_core::{
+    parse_pairing_uri as core_parse_pairing_uri, BeamDropNode, PeerEvent, PeerInfo, TransferError,
+    TransferEvent, TrustedPeer,
+};
 use iroh::NodeId;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
@@ -22,6 +25,17 @@ pub const EVENT_PEER: &str = "beamdrop://peer-event";
 pub const EVENT_TRANSFER: &str = "beamdrop://transfer-event";
 /// Event channel emitted when OS Finder / Explorer forwards `--send` paths.
 pub const EVENT_SEND_PATHS: &str = "beamdrop://send-paths";
+/// Event channel emitted when Direct Share / `--send-to` initiates a targeted send.
+pub const EVENT_TARGETED_SEND: &str = "beamdrop://targeted-send";
+/// Event channel emitted when the OS opens a `beamdrop://pair?...` deep link.
+pub const EVENT_PAIR_URI: &str = "beamdrop://pair-uri";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetedSendRequest {
+    pub target_node_id: String,
+    pub paths: Vec<String>,
+}
 
 /// Shared application state managed by Tauri.
 #[derive(Clone)]
@@ -30,6 +44,8 @@ pub struct AppState {
     pub history: Arc<RwLock<Vec<TransferRecordDto>>>,
     pub active_starts: Arc<RwLock<HashMap<Uuid, Instant>>>,
     pub pending_send_paths: Arc<Mutex<Vec<String>>>,
+    pub pending_targeted_sends: Arc<Mutex<Vec<TargetedSendRequest>>>,
+    pub pending_pairing_uris: Arc<Mutex<Vec<String>>>,
 }
 
 impl AppState {
@@ -39,6 +55,8 @@ impl AppState {
             history: Arc::new(RwLock::new(Vec::new())),
             active_starts: Arc::new(RwLock::new(HashMap::new())),
             pending_send_paths: Arc::new(Mutex::new(initial_send_paths)),
+            pending_targeted_sends: Arc::new(Mutex::new(Vec::new())),
+            pending_pairing_uris: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -48,6 +66,27 @@ impl AppState {
         }
         if let Ok(mut guard) = self.pending_send_paths.lock() {
             guard.extend(paths);
+        }
+    }
+
+    pub fn queue_targeted_send(&self, request: TargetedSendRequest) {
+        if request.target_node_id.trim().is_empty() || request.paths.is_empty() {
+            return;
+        }
+        if let Ok(mut guard) = self.pending_targeted_sends.lock() {
+            guard.push(request);
+        }
+    }
+
+    pub fn queue_pairing_uri(&self, uri: String) {
+        let trimmed = uri.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        if let Ok(mut guard) = self.pending_pairing_uris.lock() {
+            if !guard.iter().any(|existing| existing == &trimmed) {
+                guard.push(trimmed);
+            }
         }
     }
 }
@@ -75,6 +114,7 @@ pub struct PeerEntryDto {
     pub online: bool,
     pub paired: bool,
     pub auto_accept: bool,
+    pub allow_wan: bool,
     pub paired_at_unix: Option<u64>,
     pub last_seen_unix_ms: Option<u64>,
 }
@@ -97,6 +137,14 @@ pub struct TrustedPeerDto {
     pub os_type: String,
     pub paired_at_unix: u64,
     pub auto_accept: bool,
+    pub allow_wan: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeasurePathsDto {
+    pub resolved_paths: Vec<String>,
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,39 +198,121 @@ pub struct SendDispatchDto {
     pub target_node_id: String,
 }
 
-/// Parses `--send <path>...` (or bare file arguments from Explorer/Finder actions) from raw process args.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedPairingUriDto {
+    pub node_id: String,
+    pub addr: Option<String>,
+    pub pin: String,
+}
+
 #[cfg_attr(not(desktop), allow(dead_code))]
-pub fn parse_send_paths_from_args<I, S>(args: I) -> Vec<String>
+#[derive(Debug, Clone, Default)]
+pub struct ParsedCliArgs {
+    pub send_paths: Vec<String>,
+    pub targeted_send: Option<TargetedSendRequest>,
+    pub pairing_uris: Vec<String>,
+    pub launched_minimized: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliArgMode {
+    None,
+    SendPaths,
+    AwaitTargetNodeId,
+    TargetedPaths,
+}
+
+/// Parses `--send <path>...`, `--send-to <node_id> <path>...`, `--minimized`, `beamdrop://pair?...`, or bare paths from args.
+#[cfg_attr(not(desktop), allow(dead_code))]
+pub fn parse_cli_args<I, S>(args: I) -> ParsedCliArgs
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let mut paths = Vec::new();
-    let mut in_send_flag = false;
+    let mut parsed = ParsedCliArgs::default();
+    let mut mode = CliArgMode::None;
+    let mut target_node_id: Option<String> = None;
+    let mut targeted_paths: Vec<String> = Vec::new();
 
     for raw in args.into_iter().skip(1) {
         let arg = raw.as_ref();
+        if arg == "--minimized" {
+            parsed.launched_minimized = true;
+            mode = CliArgMode::None;
+            continue;
+        }
+        if arg.trim().to_ascii_lowercase().starts_with("beamdrop://") {
+            parsed.pairing_uris.push(arg.trim().to_string());
+            mode = CliArgMode::None;
+            continue;
+        }
+        if let Some(inline_target) = arg.strip_prefix("--send-to=") {
+            let trimmed = inline_target.trim();
+            if !trimmed.is_empty() {
+                target_node_id = Some(trimmed.to_string());
+                mode = CliArgMode::TargetedPaths;
+            } else {
+                mode = CliArgMode::AwaitTargetNodeId;
+            }
+            continue;
+        }
+        if arg == "--send-to" {
+            mode = CliArgMode::AwaitTargetNodeId;
+            continue;
+        }
         if let Some(inline) = arg.strip_prefix("--send=") {
             if !inline.is_empty() {
-                paths.push(inline.to_string());
+                parsed.send_paths.push(inline.to_string());
             }
-            in_send_flag = true;
+            mode = CliArgMode::SendPaths;
             continue;
         }
         if arg == "--send" || arg == "-s" {
-            in_send_flag = true;
+            mode = CliArgMode::SendPaths;
             continue;
         }
         if arg.starts_with('-') {
-            in_send_flag = false;
+            mode = CliArgMode::None;
             continue;
         }
-        if in_send_flag || Path::new(arg).exists() {
-            paths.push(arg.to_string());
+
+        match mode {
+            CliArgMode::AwaitTargetNodeId => {
+                let trimmed = arg.trim();
+                if !trimmed.is_empty() {
+                    target_node_id = Some(trimmed.to_string());
+                    mode = CliArgMode::TargetedPaths;
+                }
+            }
+            CliArgMode::TargetedPaths => {
+                if !arg.is_empty() {
+                    targeted_paths.push(arg.to_string());
+                }
+            }
+            CliArgMode::SendPaths => {
+                if !arg.is_empty() {
+                    parsed.send_paths.push(arg.to_string());
+                }
+            }
+            CliArgMode::None => {
+                if Path::new(arg).exists() {
+                    parsed.send_paths.push(arg.to_string());
+                }
+            }
         }
     }
 
-    paths
+    if let Some(target) = target_node_id {
+        if !targeted_paths.is_empty() {
+            parsed.targeted_send = Some(TargetedSendRequest {
+                target_node_id: target,
+                paths: targeted_paths,
+            });
+        }
+    }
+
+    parsed
 }
 
 fn now_unix_ms() -> u64 {
@@ -250,6 +380,7 @@ fn peer_entry_from_parts(peer: Option<&PeerInfo>, trust: Option<&TrustedPeer>) -
             online: p.online,
             paired: true,
             auto_accept: t.auto_accept,
+            allow_wan: t.allow_wan,
             paired_at_unix: Some(t.paired_at_unix),
             last_seen_unix_ms: Some(p.last_seen_unix_ms),
         },
@@ -262,6 +393,7 @@ fn peer_entry_from_parts(peer: Option<&PeerInfo>, trust: Option<&TrustedPeer>) -
             online: p.online,
             paired: false,
             auto_accept: false,
+            allow_wan: false,
             paired_at_unix: None,
             last_seen_unix_ms: Some(p.last_seen_unix_ms),
         },
@@ -274,6 +406,7 @@ fn peer_entry_from_parts(peer: Option<&PeerInfo>, trust: Option<&TrustedPeer>) -
             online: false,
             paired: true,
             auto_accept: t.auto_accept,
+            allow_wan: t.allow_wan,
             paired_at_unix: Some(t.paired_at_unix),
             last_seen_unix_ms: None,
         },
@@ -308,6 +441,169 @@ async fn get_history_entry(
         .cloned()
 }
 
+async fn emit_outgoing_failure(
+    app: &AppHandle,
+    history: &RwLock<Vec<TransferRecordDto>>,
+    peer_node_id: Option<String>,
+    peer_name: String,
+    file_name: String,
+    reason: String,
+) {
+    let record = TransferRecordDto {
+        transfer_id: Uuid::new_v4().to_string(),
+        direction: "outgoing".to_string(),
+        status: "failed".to_string(),
+        peer_node_id,
+        peer_name,
+        file_name: Some(file_name.clone()),
+        files: 1,
+        bytes_transferred: 0,
+        bytes_skipped_resumed: 0,
+        total_bytes: 0,
+        speed_mbps: 0.0,
+        streams_active: 0,
+        verified: Some(false),
+        output_dir: None,
+        reason: Some(reason.clone()),
+        updated_at_unix_ms: now_unix_ms(),
+    };
+    upsert_history(history, record.clone()).await;
+    let _ = app.emit(
+        EVENT_TRANSFER,
+        TransferEventDto {
+            kind: "failed".to_string(),
+            record,
+        },
+    );
+    send_desktop_notification(
+        app,
+        "BeamDrop transfer failed",
+        &format!("Could not send {file_name}: {reason}"),
+    );
+}
+
+async fn resolve_target_peer(
+    node: &BeamDropNode,
+    target: &str,
+) -> Result<(NodeId, String), String> {
+    let trimmed = target.trim();
+    match NodeId::from_str(trimmed) {
+        Ok(id) => {
+            let known_label = node
+                .discovery()
+                .known_peers()
+                .await
+                .into_iter()
+                .find(|p| p.node_id == id)
+                .map(|p| p.display_name);
+            let label = match known_label {
+                Some(name) => name,
+                None => node
+                    .trust_store()
+                    .get_peer(&id)
+                    .await
+                    .map(|t| t.friendly_alias)
+                    .unwrap_or_else(|| trimmed.to_string()),
+            };
+            Ok((id, label))
+        }
+        Err(_) => {
+            let peer = node
+                .resolve_peer(trimmed, Duration::from_secs(2))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok((peer.node_id, peer.display_name))
+        }
+    }
+}
+
+/// Refreshes OS-level trust targets (tray menu, Windows SendTo, Android Direct Share shortcuts).
+pub async fn sync_platform_trust_targets(
+    #[cfg_attr(not(desktop), allow(unused_variables))] app: &AppHandle,
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] node: &BeamDropNode,
+) {
+    #[cfg(desktop)]
+    crate::tray::refresh_tray_menu(app).await;
+
+    #[cfg(target_os = "windows")]
+    {
+        let trusted = node.trust_store().list_peers().await;
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::windows_sendto::sync_sendto_shortcuts(&trusted);
+        })
+        .await;
+    }
+
+    #[cfg(target_os = "android")]
+    crate::android::sync_direct_share_shortcuts();
+}
+
+/// Immediately dispatches a Direct Share or `--send-to` transfer and notifies the frontend drawer.
+pub fn resolve_and_dispatch_targeted_send(
+    app: AppHandle,
+    state: AppState,
+    request: TargetedSendRequest,
+) {
+    if request.target_node_id.trim().is_empty() || request.paths.is_empty() {
+        return;
+    }
+
+    state.queue_targeted_send(request.clone());
+    let _ = app.emit(EVENT_TARGETED_SEND, &request);
+
+    tauri::async_runtime::spawn(async move {
+        let fallback_name = request
+            .paths
+            .first()
+            .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
+            .unwrap_or("Direct Share item")
+            .to_string();
+
+        let (peer_node_id, peer_label) =
+            match resolve_target_peer(&state.node, &request.target_node_id).await {
+                Ok(resolved) => resolved,
+                Err(reason) => {
+                    emit_outgoing_failure(
+                        &app,
+                        &state.history,
+                        None,
+                        request.target_node_id.clone(),
+                        fallback_name,
+                        reason,
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+        let mut validated = Vec::with_capacity(request.paths.len());
+        let mut missing = Vec::new();
+        for raw in &request.paths {
+            let p = PathBuf::from(raw);
+            if p.exists() {
+                validated.push(p);
+            } else {
+                missing.push(raw.clone());
+            }
+        }
+
+        if validated.is_empty() {
+            emit_outgoing_failure(
+                &app,
+                &state.history,
+                Some(peer_node_id.to_string()),
+                peer_label,
+                fallback_name,
+                format!("Path does not exist: {}", missing.join(", ")),
+            )
+            .await;
+            return;
+        }
+
+        dispatch_send_paths(&app, &state, peer_node_id, peer_label, validated);
+    });
+}
+
 /// Spawns outgoing transfer tasks for `paths` to `peer_node_id`, reused by IPC commands and tray picker.
 pub fn dispatch_send_paths(
     app: &AppHandle,
@@ -331,38 +627,21 @@ pub fn dispatch_send_paths(
                 .unwrap_or_else(|| path.display().to_string());
 
             if let Err(err) = node.send_path(peer_node_id, &path, None).await {
-                let reason = err.to_string();
-                let record = TransferRecordDto {
-                    transfer_id: Uuid::new_v4().to_string(),
-                    direction: "outgoing".to_string(),
-                    status: "failed".to_string(),
-                    peer_node_id: Some(peer_node_id.to_string()),
-                    peer_name: label,
-                    file_name: Some(file_name.clone()),
-                    files: 1,
-                    bytes_transferred: 0,
-                    bytes_skipped_resumed: 0,
-                    total_bytes: 0,
-                    speed_mbps: 0.0,
-                    streams_active: 0,
-                    verified: Some(false),
-                    output_dir: None,
-                    reason: Some(reason.clone()),
-                    updated_at_unix_ms: now_unix_ms(),
-                };
-                upsert_history(&history, record.clone()).await;
-                let _ = app_handle.emit(
-                    EVENT_TRANSFER,
-                    TransferEventDto {
-                        kind: "failed".to_string(),
-                        record,
-                    },
-                );
-                send_desktop_notification(
+                if matches!(
+                    err.downcast_ref::<TransferError>(),
+                    Some(TransferError::Paused(_) | TransferError::Cancelled(_))
+                ) {
+                    return;
+                }
+                emit_outgoing_failure(
                     &app_handle,
-                    "BeamDrop transfer failed",
-                    &format!("Could not send {file_name}: {reason}"),
-                );
+                    &history,
+                    Some(peer_node_id.to_string()),
+                    label,
+                    file_name,
+                    err.to_string(),
+                )
+                .await;
             }
         });
     }
@@ -379,6 +658,7 @@ pub fn spawn_event_forwarder(app: AppHandle, state: AppState) {
         loop {
             match peer_rx.recv().await {
                 Ok(event) => {
+                    let is_paired = matches!(event, PeerEvent::Paired(_));
                     let (kind, peer) = match event {
                         PeerEvent::Discovered(p) => ("discovered", p),
                         PeerEvent::Lost(p) => ("lost", p),
@@ -391,12 +671,20 @@ pub fn spawn_event_forwarder(app: AppHandle, state: AppState) {
                     };
                     let _ = app_for_peers.emit(EVENT_PEER, &dto);
 
-                    #[cfg(desktop)]
-                    {
-                        let tray_app = app_for_peers.clone();
+                    if is_paired {
+                        let sync_app = app_for_peers.clone();
+                        let sync_node = Arc::clone(&node_for_peers);
                         tauri::async_runtime::spawn(async move {
-                            crate::tray::refresh_tray_menu(&tray_app).await;
+                            sync_platform_trust_targets(&sync_app, &sync_node).await;
                         });
+                    } else {
+                        #[cfg(desktop)]
+                        {
+                            let tray_app = app_for_peers.clone();
+                            tauri::async_runtime::spawn(async move {
+                                crate::tray::refresh_tray_menu(&tray_app).await;
+                            });
+                        }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -550,6 +838,54 @@ async fn handle_transfer_event(
                 &format!("{sender_name} wants to send {files} item(s) ({mb:.1} MiB). Open BeamDrop to accept or decline."),
             );
         }
+        TransferEvent::Started {
+            transfer_id,
+            peer_node_id,
+            peer_name,
+            file_name,
+            files,
+            total_bytes,
+            bytes_skipped_resumed,
+        } => {
+            active_starts.write().await.insert(transfer_id, Instant::now());
+            let id_str = transfer_id.to_string();
+            let existing = get_history_entry(history, &id_str).await;
+            let direction = existing
+                .as_ref()
+                .map(|r| r.direction.clone())
+                .unwrap_or_else(|| "outgoing".to_string());
+            let status = if direction == "incoming" {
+                "receiving"
+            } else {
+                "sending"
+            };
+            let record = TransferRecordDto {
+                transfer_id: id_str,
+                direction,
+                status: status.to_string(),
+                peer_node_id: Some(peer_node_id.to_string()),
+                peer_name,
+                file_name: Some(file_name),
+                files,
+                bytes_transferred: 0,
+                bytes_skipped_resumed,
+                total_bytes,
+                speed_mbps: 0.0,
+                streams_active: 0,
+                verified: None,
+                output_dir: None,
+                reason: None,
+                updated_at_unix_ms: now_ms,
+            };
+            upsert_history(history, record.clone()).await;
+            let _ = app.emit(
+                EVENT_TRANSFER,
+                TransferEventDto {
+                    kind: "started".to_string(),
+                    record,
+                },
+            );
+        }
         TransferEvent::Progress(p) => {
             let started = {
                 let mut starts = active_starts.write().await;
@@ -557,6 +893,12 @@ async fn handle_transfer_event(
             };
             let id_str = p.transfer_id.to_string();
             let existing = get_history_entry(history, &id_str).await;
+            if matches!(
+                existing.as_ref().map(|r| r.status.as_str()),
+                Some("paused" | "cancelled" | "completed" | "failed")
+            ) {
+                return;
+            }
             let direction = existing
                 .as_ref()
                 .map(|r| r.direction.clone())
@@ -691,47 +1033,97 @@ async fn handle_transfer_event(
             };
             send_desktop_notification(app, "BeamDrop transfer complete", &notif_body);
         }
+        TransferEvent::Paused { transfer_id, reason } => {
+            emit_terminal_control_record(
+                app,
+                history,
+                active_starts,
+                transfer_id,
+                "paused",
+                None,
+                reason,
+                now_ms,
+            )
+            .await;
+        }
+        TransferEvent::Cancelled { transfer_id, reason } => {
+            emit_terminal_control_record(
+                app,
+                history,
+                active_starts,
+                transfer_id,
+                "cancelled",
+                Some(false),
+                reason,
+                now_ms,
+            )
+            .await;
+        }
         TransferEvent::Interrupted { transfer_id, reason } => {
-            active_starts.write().await.remove(&transfer_id);
-            let id_str = transfer_id.to_string();
-            let existing = get_history_entry(history, &id_str).await;
-            let record = TransferRecordDto {
-                transfer_id: id_str,
-                direction: existing
-                    .as_ref()
-                    .map(|r| r.direction.clone())
-                    .unwrap_or_else(|| "incoming".to_string()),
-                status: "interrupted".to_string(),
-                peer_node_id: existing.as_ref().and_then(|r| r.peer_node_id.clone()),
-                peer_name: existing
-                    .as_ref()
-                    .map(|r| r.peer_name.clone())
-                    .unwrap_or_else(|| "Peer".to_string()),
-                file_name: existing.as_ref().and_then(|r| r.file_name.clone()),
-                files: existing.as_ref().map(|r| r.files).unwrap_or(0),
-                bytes_transferred: existing.as_ref().map(|r| r.bytes_transferred).unwrap_or(0),
-                bytes_skipped_resumed: existing
-                    .as_ref()
-                    .map(|r| r.bytes_skipped_resumed)
-                    .unwrap_or(0),
-                total_bytes: existing.as_ref().map(|r| r.total_bytes).unwrap_or(0),
-                speed_mbps: 0.0,
-                streams_active: 0,
-                verified: Some(false),
-                output_dir: None,
-                reason: Some(reason),
-                updated_at_unix_ms: now_ms,
-            };
-            upsert_history(history, record.clone()).await;
-            let _ = app.emit(
-                EVENT_TRANSFER,
-                TransferEventDto {
-                    kind: "interrupted".to_string(),
-                    record,
-                },
-            );
+            emit_terminal_control_record(
+                app,
+                history,
+                active_starts,
+                transfer_id,
+                "interrupted",
+                Some(false),
+                Some(reason),
+                now_ms,
+            )
+            .await;
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_terminal_control_record(
+    app: &AppHandle,
+    history: &RwLock<Vec<TransferRecordDto>>,
+    active_starts: &RwLock<HashMap<Uuid, Instant>>,
+    transfer_id: Uuid,
+    status: &str,
+    verified: Option<bool>,
+    reason: Option<String>,
+    now_ms: u64,
+) {
+    active_starts.write().await.remove(&transfer_id);
+    let id_str = transfer_id.to_string();
+    let existing = get_history_entry(history, &id_str).await;
+    let record = TransferRecordDto {
+        transfer_id: id_str,
+        direction: existing
+            .as_ref()
+            .map(|r| r.direction.clone())
+            .unwrap_or_else(|| "incoming".to_string()),
+        status: status.to_string(),
+        peer_node_id: existing.as_ref().and_then(|r| r.peer_node_id.clone()),
+        peer_name: existing
+            .as_ref()
+            .map(|r| r.peer_name.clone())
+            .unwrap_or_else(|| "Peer".to_string()),
+        file_name: existing.as_ref().and_then(|r| r.file_name.clone()),
+        files: existing.as_ref().map(|r| r.files).unwrap_or(0),
+        bytes_transferred: existing.as_ref().map(|r| r.bytes_transferred).unwrap_or(0),
+        bytes_skipped_resumed: existing
+            .as_ref()
+            .map(|r| r.bytes_skipped_resumed)
+            .unwrap_or(0),
+        total_bytes: existing.as_ref().map(|r| r.total_bytes).unwrap_or(0),
+        speed_mbps: 0.0,
+        streams_active: 0,
+        verified,
+        output_dir: None,
+        reason,
+        updated_at_unix_ms: now_ms,
+    };
+    upsert_history(history, record.clone()).await;
+    let _ = app.emit(
+        EVENT_TRANSFER,
+        TransferEventDto {
+            kind: status.to_string(),
+            record,
+        },
+    );
 }
 
 #[tauri::command]
@@ -800,13 +1192,11 @@ pub async fn pair_with_peer(
         },
     );
 
-    #[cfg(desktop)]
-    {
-        let tray_app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            crate::tray::refresh_tray_menu(&tray_app).await;
-        });
-    }
+    let sync_app = app.clone();
+    let sync_node = Arc::clone(&state.node);
+    tauri::async_runtime::spawn(async move {
+        sync_platform_trust_targets(&sync_app, &sync_node).await;
+    });
 
     Ok(TrustedPeerDto {
         node_id: paired.node_id.to_string(),
@@ -814,12 +1204,93 @@ pub async fn pair_with_peer(
         os_type: paired.os_type.to_string(),
         paired_at_unix: paired.paired_at_unix,
         auto_accept: paired.auto_accept,
+        allow_wan: paired.allow_wan,
     })
 }
 
 #[tauri::command]
+pub async fn set_peer_wan_enabled(
+    state: State<'_, AppState>,
+    node_id: String,
+    enabled: bool,
+) -> Result<bool, String> {
+    let parsed = NodeId::from_str(node_id.trim())
+        .map_err(|e| format!("Invalid NodeId '{node_id}': {e}"))?;
+    state
+        .node
+        .set_peer_wan_enabled(parsed, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn is_on_metered_cellular() -> Result<bool, String> {
+    #[cfg(target_os = "android")]
+    {
+        tokio::task::spawn_blocking(crate::android::is_on_metered_cellular)
+            .await
+            .map_err(|e| format!("Failed to inspect Android connectivity state: {e}"))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Ok(false)
+    }
+}
+
+#[tauri::command]
+pub async fn measure_paths_bytes(paths: Vec<String>) -> Result<MeasurePathsDto, String> {
+    let cleaned: Vec<String> = paths
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if cleaned.is_empty() {
+        return Err("No file or folder paths provided".to_string());
+    }
+
+    let validated = resolve_paths_for_platform(cleaned).await?;
+    let for_stat = validated.clone();
+    let total_bytes = tokio::task::spawn_blocking(move || compute_paths_total_bytes(&for_stat))
+        .await
+        .map_err(|e| format!("Failed to compute selection size: {e}"))?;
+
+    let resolved_paths = validated
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+
+    Ok(MeasurePathsDto {
+        resolved_paths,
+        total_bytes,
+    })
+}
+
+fn compute_paths_total_bytes(paths: &[PathBuf]) -> u64 {
+    paths.iter().map(|p| compute_entry_bytes(p)).sum()
+}
+
+fn compute_entry_bytes(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if meta.is_file() {
+        return meta.len();
+    }
+    if meta.is_dir() {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        return entries
+            .flatten()
+            .map(|entry| compute_entry_bytes(&entry.path()))
+            .sum();
+    }
+    0
+}
+
+#[tauri::command]
 pub async fn remove_trusted_peer(
-    #[cfg_attr(not(desktop), allow(unused_variables))] app: AppHandle,
+    app: AppHandle,
     state: State<'_, AppState>,
     node_id: String,
 ) -> Result<bool, String> {
@@ -827,18 +1298,15 @@ pub async fn remove_trusted_peer(
         .map_err(|e| format!("Invalid NodeId '{node_id}': {e}"))?;
     let removed = state
         .node
-        .trust_store()
-        .remove_peer(&parsed)
+        .remove_trusted_peer(&parsed)
         .await
         .map_err(|e| e.to_string())?;
 
-    #[cfg(desktop)]
-    {
-        let tray_app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            crate::tray::refresh_tray_menu(&tray_app).await;
-        });
-    }
+    let sync_app = app.clone();
+    let sync_node = Arc::clone(&state.node);
+    tauri::async_runtime::spawn(async move {
+        sync_platform_trust_targets(&sync_app, &sync_node).await;
+    });
 
     Ok(removed.is_some())
 }
@@ -850,47 +1318,109 @@ pub async fn send_paths(
     target_node_id: String,
     paths: Vec<String>,
 ) -> Result<SendDispatchDto, String> {
-    if paths.is_empty() {
+    let cleaned: Vec<String> = paths
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if cleaned.is_empty() {
         return Err("No file or folder paths provided".to_string());
     }
 
-    let (peer_node_id, peer_label) = match NodeId::from_str(target_node_id.trim()) {
-        Ok(id) => {
-            let label = state
-                .node
-                .discovery()
-                .known_peers()
-                .await
-                .into_iter()
-                .find(|p| p.node_id == id)
-                .map(|p| p.display_name)
-                .unwrap_or_else(|| target_node_id.clone());
-            (id, label)
-        }
-        Err(_) => {
-            let peer = state
-                .node
-                .resolve_peer(target_node_id.trim(), Duration::from_secs(2))
-                .await
-                .map_err(|e| e.to_string())?;
-            (peer.node_id, peer.display_name)
-        }
-    };
-
-    let mut validated = Vec::with_capacity(paths.len());
-    for raw in paths {
-        let p = PathBuf::from(&raw);
-        if !p.exists() {
-            return Err(format!("Path does not exist: {}", p.display()));
-        }
-        validated.push(p);
-    }
+    let (peer_node_id, peer_label) = resolve_target_peer(&state.node, &target_node_id).await?;
+    let validated = resolve_paths_for_platform(cleaned).await?;
 
     let queued = dispatch_send_paths(&app, &state, peer_node_id, peer_label, validated);
     Ok(SendDispatchDto {
         queued,
         target_node_id: peer_node_id.to_string(),
     })
+}
+
+async fn resolve_paths_for_platform(paths: Vec<String>) -> Result<Vec<PathBuf>, String> {
+    #[cfg(target_os = "android")]
+    let resolved_strings = {
+        let expected_len = paths.len();
+        let resolved = tokio::task::spawn_blocking(move || crate::android::resolve_content_uris(&paths))
+            .await
+            .map_err(|e| format!("Failed to resolve Android file URIs: {e}"))??;
+        if resolved.is_empty() || resolved.len() != expected_len {
+            return Err("Could not read one or more selected files from Android storage".to_string());
+        }
+        resolved
+    };
+
+    #[cfg(not(target_os = "android"))]
+    let resolved_strings = paths;
+
+    let mut validated = Vec::with_capacity(resolved_strings.len());
+    for raw in resolved_strings {
+        let p = PathBuf::from(&raw);
+        if !p.exists() {
+            return Err(format!("Path does not exist: {}", p.display()));
+        }
+        validated.push(p);
+    }
+    Ok(validated)
+}
+
+#[tauri::command]
+pub async fn pause_transfer(
+    state: State<'_, AppState>,
+    transfer_id: String,
+) -> Result<bool, String> {
+    let parsed_id = Uuid::from_str(transfer_id.trim())
+        .map_err(|e| format!("Invalid transfer UUID '{transfer_id}': {e}"))?;
+    Ok(state.node.pause_transfer(parsed_id).await)
+}
+
+#[tauri::command]
+pub async fn resume_transfer(
+    state: State<'_, AppState>,
+    transfer_id: String,
+) -> Result<(), String> {
+    let parsed_id = Uuid::from_str(transfer_id.trim())
+        .map_err(|e| format!("Invalid transfer UUID '{transfer_id}': {e}"))?;
+    state
+        .node
+        .resume_transfer(parsed_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn cancel_transfer(
+    state: State<'_, AppState>,
+    transfer_id: String,
+) -> Result<bool, String> {
+    let parsed_id = Uuid::from_str(transfer_id.trim())
+        .map_err(|e| format!("Invalid transfer UUID '{transfer_id}': {e}"))?;
+    Ok(state.node.cancel_transfer(parsed_id).await)
+}
+
+#[tauri::command]
+pub async fn refresh_peers(state: State<'_, AppState>) -> Result<Vec<PeerEntryDto>, String> {
+    state.node.refresh_peers().await;
+    Ok(collect_peer_entries(&state.node).await)
+}
+
+#[tauri::command]
+pub async fn parse_pairing_uri(uri: String) -> Result<ParsedPairingUriDto, String> {
+    let parsed = core_parse_pairing_uri(&uri).map_err(|e| e.to_string())?;
+    Ok(ParsedPairingUriDto {
+        node_id: parsed.node_id.to_string(),
+        addr: parsed.addr.map(|a| a.to_string()),
+        pin: parsed.pin,
+    })
+}
+
+#[tauri::command]
+pub async fn take_pending_pairing_uri(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let mut guard = state
+        .pending_pairing_uris
+        .lock()
+        .map_err(|_| "Failed to lock pending pairing URIs".to_string())?;
+    Ok(std::mem::take(&mut *guard))
 }
 
 #[tauri::command]
@@ -936,6 +1466,17 @@ pub async fn take_pending_send_paths(
         .pending_send_paths
         .lock()
         .map_err(|_| "Failed to lock pending send paths".to_string())?;
+    Ok(std::mem::take(&mut *guard))
+}
+
+#[tauri::command]
+pub async fn take_pending_targeted_send(
+    state: State<'_, AppState>,
+) -> Result<Vec<TargetedSendRequest>, String> {
+    let mut guard = state
+        .pending_targeted_sends
+        .lock()
+        .map_err(|_| "Failed to lock pending targeted sends".to_string())?;
     Ok(std::mem::take(&mut *guard))
 }
 
@@ -1088,4 +1629,59 @@ mod windows_firewall {
         check_windows_firewall_impl()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cli_args_extracts_send_to_target_and_paths() {
+        let parsed = parse_cli_args([
+            "beamdrop-app",
+            "--send-to",
+            "node123456",
+            "/tmp/photo.jpg",
+            "/tmp/doc.pdf",
+        ]);
+        assert!(!parsed.launched_minimized);
+        assert!(parsed.send_paths.is_empty());
+        assert_eq!(
+            parsed.targeted_send,
+            Some(TargetedSendRequest {
+                target_node_id: "node123456".to_string(),
+                paths: vec!["/tmp/photo.jpg".to_string(), "/tmp/doc.pdf".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_extracts_inline_send_to_send_and_minimized() {
+        let parsed = parse_cli_args([
+            "beamdrop-app",
+            "--minimized",
+            "--send",
+            "/tmp/broadcast.zip",
+            "--send-to=peerABC",
+            "/tmp/direct.png",
+        ]);
+        assert!(parsed.launched_minimized);
+        assert_eq!(parsed.send_paths, vec!["/tmp/broadcast.zip".to_string()]);
+        assert_eq!(
+            parsed.targeted_send,
+            Some(TargetedSendRequest {
+                target_node_id: "peerABC".to_string(),
+                paths: vec!["/tmp/direct.png".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_extracts_beamdrop_pairing_uri() {
+        let uri = "beamdrop://pair?node=abc123&addr=192.168.1.10:4433&pin=123456";
+        let parsed = parse_cli_args(["beamdrop-app", uri]);
+        assert!(parsed.send_paths.is_empty());
+        assert_eq!(parsed.pairing_uris, vec![uri.to_string()]);
+    }
+}
+
 

@@ -4,6 +4,7 @@ pub mod protocol;
 pub mod transfer;
 pub mod trust;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -11,31 +12,37 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
+use iroh::endpoint::Connection;
 use iroh::{Endpoint, NodeAddr, NodeId};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, Instant};
 use uuid::Uuid;
 
 pub use discovery::{
-    build_iroh_endpoint, ping_peer, DiscoveryEngine, DiscoveryError, PeerEvent, PeerInfo,
-    PeerTable, KNOWN_PEERS_FILENAME, MDNS_SERVICE_TYPE,
+    build_iroh_endpoint, build_iroh_endpoint_with_wan, is_endpoint_connection_lan,
+    is_local_lan_ip, ping_peer, ControlChannels, DiscoveryEngine, DiscoveryError, PeerEvent,
+    PeerInfo, PeerTable, ResumeRequest, KNOWN_PEERS_FILENAME, MDNS_SERVICE_TYPE,
 };
 pub use identity::{DeviceIdentity, IdentityError, OsType};
 pub use protocol::{
     read_frame, transfer_stream_id, write_frame, AcceptPayload, AcceptedFileResume, ChunkRange,
     CompletePayload, FileHashEntry, FileOfferEntry, HelloPayload, Message, MessageType,
     OfferPayload, PairConfirmPayload, PairRequestPayload, PingPayload, PongPayload, ProtocolError,
-    RejectPayload, BEAMDROP_ALPN, FRAME_HEADER_LEN, MAX_FRAME_PAYLOAD_LEN, PROTOCOL_VERSION,
+    RejectPayload, TransferControlPayload, BEAMDROP_ALPN, FRAME_HEADER_LEN, MAX_FRAME_PAYLOAD_LEN,
+    PROTOCOL_VERSION,
 };
 pub use transfer::{
-    default_download_dir, hash_file_blake3, part_path_for, resume_path_for, ChunkHeader,
-    ResumeMetadata, TransferEngine, TransferError, TransferEvent, TransferProgress,
-    TransferSummary, CHANNEL_BOUND, CHUNK_SIZE, DEFAULT_APPROVAL_TIMEOUT, MAX_PARALLEL_STREAMS,
-    PARALLEL_STRIPE_THRESHOLD, UNI_CHUNK_HEADER_LEN,
+    current_utc_day, default_download_dir, derive_daily_wan_key, hash_file_blake3, part_path_for,
+    resume_path_for, ChunkHeader, ResumeMetadata, TransferEngine, TransferError, TransferEvent,
+    TransferProgress, TransferSummary, WanCipherContext, CHANNEL_BOUND, CHUNK_SIZE,
+    DEFAULT_APPROVAL_TIMEOUT, MAX_PARALLEL_STREAMS, PARALLEL_STRIPE_THRESHOLD,
+    UNI_CHUNK_HEADER_LEN, WAN_CHUNK_OVERHEAD,
 };
 pub use trust::{
-    detect_lan_ip, format_pairing_uri, normalize_pin, parse_pairing_uri, PairingSession,
-    ParsedPairingUri, TrustError, TrustStore, TrustedPeer, PAIRING_PIN_TTL, TRUSTED_PEERS_FILENAME,
+    derive_wan_shared_secret, detect_lan_ip, format_pairing_uri, normalize_pin, parse_pairing_uri,
+    PairingSession, ParsedPairingUri, TrustError, TrustStore, TrustedPeer, PAIRING_PIN_TTL,
+    TRUSTED_PEERS_FILENAME,
 };
 
 /// Configuration options for starting a `BeamDropNode`.
@@ -52,14 +59,23 @@ pub struct NodeConfig {
     pub port: u16,
 }
 
+#[derive(Debug, Clone)]
+struct PausedOutgoingInfo {
+    peer_node_id: NodeId,
+    peer_name: Option<String>,
+    source_path: PathBuf,
+}
+
 /// High-level BeamDrop peer-to-peer node combining identity, Iroh QUIC transport,
 /// mDNS + disk-cached discovery, and bounded-memory parallel QUIC transfers.
 pub struct BeamDropNode {
     identity: DeviceIdentity,
-    endpoint: Endpoint,
-    discovery: DiscoveryEngine,
+    discovery: Arc<DiscoveryEngine>,
     transfer: Arc<TransferEngine>,
     trust: Arc<TrustStore>,
+    paused_outgoing: Arc<RwLock<HashMap<Uuid, PausedOutgoingInfo>>>,
+    active_resume_tasks: Arc<Mutex<JoinSet<()>>>,
+    control_task: JoinHandle<()>,
 }
 
 impl BeamDropNode {
@@ -87,30 +103,103 @@ impl BeamDropNode {
             }
         }
 
-        let trust = Arc::new(TrustStore::load_or_create(&trust_path, identity.node_id)?);
+        let trust = Arc::new(TrustStore::load_or_create_with_identity(
+            &trust_path,
+            &identity,
+        )?);
+        let initial_wan = trust.any_wan_enabled().await;
         let initial_table = PeerTable::load_or_create(&peers_path)?;
-        let endpoint =
-            build_iroh_endpoint(&identity, config.port, initial_table.cached_node_addrs()).await?;
+        let endpoint = build_iroh_endpoint_with_wan(
+            &identity,
+            config.port,
+            initial_table.cached_node_addrs(),
+            initial_wan,
+        )
+        .await?;
 
         let transfer = Arc::new(TransferEngine::with_trust_store(
             config.download_dir,
             Some(Arc::clone(&trust)),
         )?);
-        let discovery = DiscoveryEngine::start_with_services(
-            identity.clone(),
-            endpoint.clone(),
-            Some(peers_path),
-            Some(Arc::clone(&transfer)),
-            Some(Arc::clone(&trust)),
-        )
-        .await?;
+        let (resume_tx, mut resume_rx) = mpsc::unbounded_channel::<ResumeRequest>();
+        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<(Uuid, Option<String>)>();
+        let discovery = Arc::new(
+            DiscoveryEngine::start_with_handlers(
+                identity.clone(),
+                endpoint,
+                Some(peers_path),
+                Some(Arc::clone(&transfer)),
+                Some(Arc::clone(&trust)),
+                Some(ControlChannels {
+                    resume_tx,
+                    cancel_tx,
+                }),
+            )
+            .await?,
+        );
+
+        let paused_outgoing: Arc<RwLock<HashMap<Uuid, PausedOutgoingInfo>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let active_resume_tasks: Arc<Mutex<JoinSet<()>>> = Arc::new(Mutex::new(JoinSet::new()));
+
+        let control_task = {
+            let disc = Arc::clone(&discovery);
+            let tr = Arc::clone(&transfer);
+            let host = identity.hostname.clone();
+            let paused = Arc::clone(&paused_outgoing);
+            let tasks = Arc::clone(&active_resume_tasks);
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        Some((transfer_id, requester_node_id, reply_tx)) = resume_rx.recv() => {
+                            let maybe_info = {
+                                let mut guard = paused.write().await;
+                                match guard.get(&transfer_id) {
+                                    Some(info) if info.peer_node_id == requester_node_id => guard.remove(&transfer_id),
+                                    Some(_) => {
+                                        let _ = reply_tx.send(Err("Transfer does not belong to requesting peer".to_string()));
+                                        continue;
+                                    }
+                                    None => {
+                                        let _ = reply_tx.send(Err(format!("No paused outgoing transfer found for ID {transfer_id}")));
+                                        continue;
+                                    }
+                                }
+                            };
+                            if let Some(info) = maybe_info {
+                                let _ = reply_tx.send(Ok(()));
+                                spawn_resumed_outgoing(
+                                    Arc::clone(&disc),
+                                    Arc::clone(&tr),
+                                    host.clone(),
+                                    Arc::clone(&paused),
+                                    Arc::clone(&tasks),
+                                    transfer_id,
+                                    info,
+                                    None,
+                                )
+                                .await;
+                            }
+                        }
+                        Some((transfer_id, reason)) = cancel_rx.recv() => {
+                            if paused.write().await.remove(&transfer_id).is_some() {
+                                tr.emit_cancelled(transfer_id, reason);
+                            }
+                        }
+                        else => break,
+                    }
+                }
+            })
+        };
 
         Ok(Self {
             identity,
-            endpoint,
             discovery,
             transfer,
             trust,
+            paused_outgoing,
+            active_resume_tasks,
+            control_task,
         })
     }
 
@@ -119,9 +208,9 @@ impl BeamDropNode {
         &self.identity
     }
 
-    /// Returns the underlying `iroh::Endpoint`.
-    pub fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
+    /// Returns a clone of the currently active `iroh::Endpoint`.
+    pub fn endpoint(&self) -> Endpoint {
+        self.discovery.endpoint()
     }
 
     /// Returns the `DiscoveryEngine`.
@@ -194,9 +283,10 @@ impl BeamDropNode {
             }
         };
 
+        let endpoint = self.discovery.endpoint();
         let node_addr = NodeAddr::from_parts(peer_node_id, None, vec![peer_addr]);
-        self.endpoint.add_node_addr(node_addr.clone())?;
-        let conn = self.endpoint.connect(node_addr, BEAMDROP_ALPN).await?;
+        endpoint.add_node_addr(node_addr.clone())?;
+        let conn = endpoint.connect(node_addr, BEAMDROP_ALPN).await?;
 
         let auth_remote = conn.remote_node_id()?;
         if auth_remote != peer_node_id {
@@ -243,7 +333,7 @@ impl BeamDropNode {
                     .await?;
                 self.discovery
                     .record_paired_peer(
-                        &self.endpoint,
+                        &endpoint,
                         confirm.responder_node_id,
                         confirm.display_name,
                         confirm.os_type,
@@ -292,9 +382,30 @@ impl BeamDropNode {
 
     /// Dials a known peer by `NodeId` and measures QUIC `Ping`/`Pong` latency.
     pub async fn ping(&self, node_id: NodeId) -> Result<Duration> {
-        let conn = self.discovery.dial_peer(&self.endpoint, node_id).await?;
+        let ep = self.discovery.endpoint();
+        let conn = self.discovery.dial_peer(&ep, node_id).await?;
         let rtt = ping_peer(&conn, rand::random()).await?;
         Ok(rtt)
+    }
+
+    /// Toggles long-distance WAN transfers for a trusted contact and dynamically enables/disables
+    /// global Pkarr discovery and relay transport on the local endpoint.
+    pub async fn set_peer_wan_enabled(&self, node_id: NodeId, enabled: bool) -> Result<bool> {
+        let updated = self.trust.set_peer_wan_enabled(&node_id, enabled).await?;
+        let any_wan = self.trust.any_wan_enabled().await;
+        self.discovery.reconfigure_wan_transport(any_wan).await?;
+        Ok(updated)
+    }
+
+    /// Removes a trusted contact from the trust store and disables WAN relay transport if no
+    /// remaining contacts use long-distance transfers.
+    pub async fn remove_trusted_peer(&self, node_id: &NodeId) -> Result<Option<TrustedPeer>> {
+        let removed = self.trust.remove_peer(node_id).await?;
+        if removed.is_some() {
+            let any_wan = self.trust.any_wan_enabled().await;
+            self.discovery.reconfigure_wan_transport(any_wan).await?;
+        }
+        Ok(removed)
     }
 
     /// Resolves a peer by exact `NodeId`, unique `NodeId` prefix, or display name,
@@ -385,6 +496,117 @@ impl BeamDropNode {
         ))
     }
 
+    /// Triggers a direct QUIC probe across cached peers when mDNS is unavailable or app resumes.
+    pub async fn refresh_peers(&self) {
+        self.discovery.probe_cached_peers_now().await;
+    }
+
+    /// Requests a graceful pause for an active incoming or outgoing transfer, keeping `.resume.json`.
+    pub async fn pause_transfer(&self, transfer_id: Uuid) -> bool {
+        self.transfer.pause_transfer(transfer_id).await
+    }
+
+    /// Cancels an active or paused incoming or outgoing transfer and removes incomplete partial files.
+    pub async fn cancel_transfer(&self, transfer_id: Uuid) -> bool {
+        let ep = self.discovery.endpoint();
+        let paused_sender = self.transfer.paused_incoming_sender(transfer_id).await;
+        if self.transfer.cancel_transfer(transfer_id).await {
+            if let Some(sender_node_id) = paused_sender {
+                send_remote_cancel_best_effort(
+                    &self.discovery,
+                    &ep,
+                    sender_node_id,
+                    transfer_id,
+                    Some("Cancelled by peer".to_string()),
+                )
+                .await;
+            }
+            return true;
+        }
+
+        if let Some(info) = self.paused_outgoing.write().await.remove(&transfer_id) {
+            self.transfer
+                .emit_cancelled(transfer_id, Some("Cancelled by user".to_string()));
+            send_remote_cancel_best_effort(
+                &self.discovery,
+                &ep,
+                info.peer_node_id,
+                transfer_id,
+                Some("Cancelled by peer".to_string()),
+            )
+            .await;
+            return true;
+        }
+
+        false
+    }
+
+    /// Resumes a paused incoming or outgoing transfer by reusing `transfer_id` and `.resume.json`.
+    pub async fn resume_transfer(&self, transfer_id: Uuid) -> Result<()> {
+        let ep = self.discovery.endpoint();
+        if let Some(sender_node_id) = self.transfer.paused_incoming_sender(transfer_id).await {
+            let conn = self
+                .discovery
+                .dial_peer(&ep, sender_node_id)
+                .await?;
+            let (mut send, mut recv) = conn.open_bi().await?;
+            let req = Message::Resume(TransferControlPayload {
+                transfer_id,
+                reason: None,
+            });
+            write_frame(&mut send, &req).await?;
+            let _ = send.finish();
+
+            match read_frame(&mut recv).await? {
+                Message::Resume(_) => return Ok(()),
+                Message::Reject(rej) => {
+                    bail!(rej
+                        .reason
+                        .unwrap_or_else(|| "Resume rejected by sender".to_string()))
+                }
+                other => {
+                    bail!(
+                        "Unexpected response to Resume request: {:?}",
+                        other.message_type()
+                    )
+                }
+            }
+        }
+
+        let info = self
+            .paused_outgoing
+            .write()
+            .await
+            .remove(&transfer_id)
+            .ok_or_else(|| anyhow!("No paused transfer found for ID {transfer_id}"))?;
+
+        let conn = match self
+            .discovery
+            .dial_peer(&ep, info.peer_node_id)
+            .await
+        {
+            Ok(c) => c,
+            Err(err) => {
+                self.paused_outgoing.write().await.insert(transfer_id, info);
+                return Err(err.into());
+            }
+        };
+
+        spawn_resumed_outgoing(
+            Arc::clone(&self.discovery),
+            Arc::clone(&self.transfer),
+            self.identity.hostname.clone(),
+            Arc::clone(&self.paused_outgoing),
+            Arc::clone(&self.active_resume_tasks),
+            transfer_id,
+            info,
+            Some(conn),
+        )
+        .await;
+
+        Ok(())
+    }
+
     /// Sends a single file or recursive directory to `peer_node_id` over Iroh QUIC.
     pub async fn send_path(
         &self,
@@ -392,22 +614,184 @@ impl BeamDropNode {
         source_path: impl AsRef<Path>,
         progress_tx: Option<mpsc::Sender<TransferProgress>>,
     ) -> Result<TransferSummary> {
+        self.send_path_with_wan_override(peer_node_id, source_path, None, progress_tx)
+            .await
+    }
+
+    /// Sends a single file or recursive directory to `peer_node_id` with optional explicit
+    /// override for daily-rotating ChaCha20-Poly1305 WAN encryption (`None` = auto-detect LAN/WAN).
+    pub async fn send_path_with_wan_override(
+        &self,
+        peer_node_id: NodeId,
+        source_path: impl AsRef<Path>,
+        force_wan_encryption: Option<bool>,
+        progress_tx: Option<mpsc::Sender<TransferProgress>>,
+    ) -> Result<TransferSummary> {
+        let transfer_id = Uuid::new_v4();
+        let source_buf = source_path.as_ref().to_path_buf();
+        let peer_name = self.resolve_peer_display_name(peer_node_id).await;
+        let ep = self.discovery.endpoint();
         let conn = self
             .discovery
-            .dial_peer(&self.endpoint, peer_node_id)
+            .dial_peer(&ep, peer_node_id)
             .await?;
-        let summary = self
-            .transfer
-            .send_path(&conn, &self.identity.hostname, source_path.as_ref(), progress_tx)
-            .await?;
-        Ok(summary)
+        run_tracked_send(
+            &self.transfer,
+            &conn,
+            &self.identity.hostname,
+            transfer_id,
+            peer_node_id,
+            peer_name.as_deref(),
+            &source_buf,
+            progress_tx,
+            &self.paused_outgoing,
+            force_wan_encryption,
+        )
+        .await
+    }
+
+    async fn resolve_peer_display_name(&self, peer_node_id: NodeId) -> Option<String> {
+        if let Some(peer) = self
+            .discovery
+            .known_peers()
+            .await
+            .into_iter()
+            .find(|p| p.node_id == peer_node_id)
+        {
+            return Some(peer.display_name);
+        }
+        self.trust
+            .get_peer(&peer_node_id)
+            .await
+            .map(|p| p.friendly_alias)
     }
 
     /// Gracefully shuts down the discovery engine and closes the Iroh QUIC endpoint.
     pub async fn shutdown(self) {
-        self.discovery.shutdown().await;
-        self.endpoint.close().await;
+        self.control_task.abort();
+        let _ = self.control_task.await;
+        self.active_resume_tasks.lock().await.shutdown().await;
+        let ep = self.discovery.endpoint();
+        if let Ok(disc) = Arc::try_unwrap(self.discovery) {
+            disc.shutdown().await;
+        }
+        ep.close().await;
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_tracked_send(
+    transfer: &Arc<TransferEngine>,
+    conn: &Connection,
+    local_hostname: &str,
+    transfer_id: Uuid,
+    peer_node_id: NodeId,
+    peer_name: Option<&str>,
+    source_path: &Path,
+    progress_tx: Option<mpsc::Sender<TransferProgress>>,
+    paused_outgoing: &Arc<RwLock<HashMap<Uuid, PausedOutgoingInfo>>>,
+    force_wan_encryption: Option<bool>,
+) -> Result<TransferSummary> {
+    let res = transfer
+        .send_path_with_wan_override(
+            conn,
+            local_hostname,
+            source_path,
+            peer_name,
+            Some(transfer_id),
+            progress_tx,
+            force_wan_encryption,
+        )
+        .await;
+
+    match res {
+        Ok(summary) => {
+            paused_outgoing.write().await.remove(&transfer_id);
+            Ok(summary)
+        }
+        Err(err) => {
+            match err {
+                TransferError::Paused(_) => {
+                    paused_outgoing.write().await.insert(
+                        transfer_id,
+                        PausedOutgoingInfo {
+                            peer_node_id,
+                            peer_name: peer_name.map(ToOwned::to_owned),
+                            source_path: source_path.to_path_buf(),
+                        },
+                    );
+                }
+                TransferError::Cancelled(_) => {
+                    paused_outgoing.write().await.remove(&transfer_id);
+                }
+                _ => {}
+            }
+            Err(err.into())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_resumed_outgoing(
+    discovery: Arc<DiscoveryEngine>,
+    transfer: Arc<TransferEngine>,
+    local_hostname: String,
+    paused_outgoing: Arc<RwLock<HashMap<Uuid, PausedOutgoingInfo>>>,
+    active_resume_tasks: Arc<Mutex<JoinSet<()>>>,
+    transfer_id: Uuid,
+    info: PausedOutgoingInfo,
+    pre_dialed: Option<Connection>,
+) {
+    let mut tasks = active_resume_tasks.lock().await;
+    tasks.spawn(async move {
+        let ep = discovery.endpoint();
+        let conn = match pre_dialed {
+            Some(c) => c,
+            None => match discovery.dial_peer(&ep, info.peer_node_id).await {
+                Ok(c) => c,
+                Err(_) => {
+                    paused_outgoing.write().await.insert(transfer_id, info);
+                    return;
+                }
+            },
+        };
+
+        let _ = run_tracked_send(
+            &transfer,
+            &conn,
+            &local_hostname,
+            transfer_id,
+            info.peer_node_id,
+            info.peer_name.as_deref(),
+            &info.source_path,
+            None,
+            &paused_outgoing,
+            None,
+        )
+        .await;
+    });
+}
+
+async fn send_remote_cancel_best_effort(
+    discovery: &DiscoveryEngine,
+    endpoint: &Endpoint,
+    peer_node_id: NodeId,
+    transfer_id: Uuid,
+    reason: Option<String>,
+) {
+    let _ = timeout(Duration::from_secs(3), async {
+        let conn = discovery.dial_peer(endpoint, peer_node_id).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        let frame = Message::Cancel(TransferControlPayload {
+            transfer_id,
+            reason,
+        });
+        write_frame(&mut send, &frame).await?;
+        let _ = send.finish();
+        let _ = recv.read_to_end(0).await;
+        anyhow::Ok(())
+    })
+    .await;
 }
 
 fn peer_matches_query(peer: &PeerInfo, query: &str) -> bool {

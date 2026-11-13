@@ -6,17 +6,14 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.provider.OpenableColumns
 import android.provider.Settings
 import android.system.Os
-import android.webkit.MimeTypeMap
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
+import androidx.core.content.pm.ShortcutManagerCompat
 import java.io.File
-import java.io.FileOutputStream
-import java.util.UUID
 import java.util.concurrent.Executors
 
 class MainActivity : TauriActivity() {
@@ -33,16 +30,16 @@ class MainActivity : TauriActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
 
-        BeamDropBridge.markNativeReady()
         ensureReceiveServiceStarted()
+        BeamDropShortcuts.syncShortcuts(this)
         cleanupStaleShareCache()
-        handleShareIntent(intent)
+        handleIncomingIntent(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        handleShareIntent(intent)
+        handleIncomingIntent(intent)
     }
 
     override fun onDestroy() {
@@ -105,9 +102,18 @@ class MainActivity : TauriActivity() {
         }
     }
 
-    private fun handleShareIntent(incoming: Intent?) {
+    private fun handleIncomingIntent(incoming: Intent?) {
         val intent = incoming ?: return
         val action = intent.action ?: return
+
+        if (action == Intent.ACTION_VIEW) {
+            val uriStr = intent.dataString ?: intent.data?.toString()
+            if (!uriStr.isNullOrBlank() && uriStr.startsWith("beamdrop://", ignoreCase = true)) {
+                BeamDropBridge.enqueuePairingUri(uriStr)
+            }
+            return
+        }
+
         if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) {
             return
         }
@@ -115,10 +121,27 @@ class MainActivity : TauriActivity() {
         val uris = collectSharedUris(intent)
         if (uris.isEmpty()) return
 
+        val shortcutId = intent.getStringExtra(ShortcutManagerCompat.EXTRA_SHORTCUT_ID)
+            ?: if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                intent.getStringExtra(Intent.EXTRA_SHORTCUT_ID)
+            } else {
+                null
+            }
+        val targetNodeId = shortcutId
+            ?.takeIf { it.startsWith(BeamDropShortcuts.SHORTCUT_ID_PREFIX) }
+            ?.removePrefix(BeamDropShortcuts.SHORTCUT_ID_PREFIX)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+
+        val rawUris = uris.map { it.toString() }.toTypedArray()
         shareExecutor.execute {
-            val copiedPaths = copySharedUrisToCache(uris)
+            val copiedPaths = BeamDropBridge.resolveContentUris(this, rawUris).toList()
             if (copiedPaths.isNotEmpty()) {
-                BeamDropBridge.enqueuePaths(copiedPaths)
+                if (targetNodeId != null) {
+                    BeamDropBridge.enqueueTargetedSend(targetNodeId, copiedPaths)
+                } else {
+                    BeamDropBridge.enqueuePaths(copiedPaths)
+                }
             }
         }
     }
@@ -147,113 +170,9 @@ class MainActivity : TauriActivity() {
         return ordered.toList()
     }
 
-    private fun copySharedUrisToCache(uris: List<Uri>): List<String> {
-        val batchDir = File(File(cacheDir, SHARE_CACHE_SUBDIR), UUID.randomUUID().toString())
-        if (!batchDir.exists() && !batchDir.mkdirs()) {
-            return emptyList()
-        }
-
-        val resolvedPaths = mutableListOf<String>()
-        val buffer = ByteArray(COPY_BUFFER_BYTES)
-
-        for ((index, uri) in uris.withIndex()) {
-            val rawName = queryDisplayName(uri) ?: fallbackFileName(uri, index)
-            val safeName = sanitizeFileName(rawName, "shared_item_${index + 1}")
-            val destFile = resolveUniqueFile(batchDir, safeName)
-
-            val copied = try {
-                contentResolver.openInputStream(uri)?.use { input ->
-                    FileOutputStream(destFile).use { output ->
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read <= 0) break
-                            output.write(buffer, 0, read)
-                        }
-                        output.flush()
-                    }
-                    true
-                } ?: false
-            } catch (_: Exception) {
-                destFile.delete()
-                false
-            }
-
-            if (copied && destFile.isFile) {
-                resolvedPaths.add(destFile.absolutePath)
-            }
-        }
-
-        return resolvedPaths
-    }
-
-    private fun queryDisplayName(uri: Uri): String? {
-        if ("file".equals(uri.scheme, ignoreCase = true)) {
-            return uri.lastPathSegment
-        }
-        return try {
-            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-                ?.use { cursor ->
-                    if (cursor.moveToFirst()) {
-                        val col = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                        if (col >= 0) cursor.getString(col) else null
-                    } else {
-                        null
-                    }
-                }
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private fun fallbackFileName(uri: Uri, index: Int): String {
-        val mime = try {
-            contentResolver.getType(uri)
-        } catch (_: Exception) {
-            null
-        }
-        val ext = if (!mime.isNullOrBlank()) {
-            MimeTypeMap.getSingleton().getExtensionFromMimeType(mime)
-        } else {
-            null
-        }
-        return if (!ext.isNullOrBlank()) {
-            "shared_${index + 1}.$ext"
-        } else {
-            "shared_${index + 1}"
-        }
-    }
-
-    private fun sanitizeFileName(name: String, fallback: String): String {
-        val stripped = name
-            .replace('\\', '/')
-            .substringAfterLast('/')
-            .trim()
-            .filter { ch -> ch >= ' ' && ch != '/' && ch != '\\' && ch != '\u0000' }
-
-        if (stripped.isEmpty() || stripped == "." || stripped == "..") {
-            return fallback
-        }
-        return stripped
-    }
-
-    private fun resolveUniqueFile(dir: File, name: String): File {
-        val first = File(dir, name)
-        if (!first.exists()) return first
-
-        val dot = name.lastIndexOf('.')
-        val stem = if (dot > 0) name.substring(0, dot) else name
-        val ext = if (dot > 0) name.substring(dot) else ""
-
-        for (i in 1..9999) {
-            val candidate = File(dir, "$stem ($i)$ext")
-            if (!candidate.exists()) return candidate
-        }
-        return File(dir, "${System.currentTimeMillis()}_$name")
-    }
-
     private fun cleanupStaleShareCache() {
         shareExecutor.execute {
-            val shareRoot = File(cacheDir, SHARE_CACHE_SUBDIR)
+            val shareRoot = File(cacheDir, BeamDropBridge.SHARE_CACHE_SUBDIR)
             if (!shareRoot.isDirectory) return@execute
             val cutoffMs = System.currentTimeMillis() - SHARE_CACHE_TTL_MS
             shareRoot.listFiles()?.forEach { child ->
@@ -265,8 +184,6 @@ class MainActivity : TauriActivity() {
     }
 
     companion object {
-        private const val SHARE_CACHE_SUBDIR = "beamdrop_share"
-        private const val COPY_BUFFER_BYTES = 131_072 // 128 KiB streaming copy
         private const val SHARE_CACHE_TTL_MS = 24L * 60L * 60L * 1000L
     }
 }

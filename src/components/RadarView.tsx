@@ -16,8 +16,9 @@ interface RadarViewProps {
 }
 
 function layoutPeers(peers: PeerEntry[]) {
-  const inner = peers.filter((p) => p.online && p.addr !== null);
-  const outer = peers.filter((p) => !(p.online && p.addr !== null));
+  const live = peers.filter((p) => p.online);
+  const inner = live.filter((p) => p.addr !== null);
+  const outer = live.filter((p) => p.addr === null);
   const place = (group: PeerEntry[], radius: number, offset: number) =>
     group.map((peer, i) => {
       const a = -Math.PI / 2 + offset + (i * 2 * Math.PI) / group.length;

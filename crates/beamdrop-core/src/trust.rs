@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use curve25519_dalek::MontgomeryPoint;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh::NodeId;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,8 @@ pub const TRUSTED_PEERS_FILENAME: &str = "trusted_peers.json";
 /// Validity window for one-time 6-digit pairing PINs (5 minutes).
 pub const PAIRING_PIN_TTL: Duration = Duration::from_secs(5 * 60);
 
+const WAN_SHARED_SECRET_CONTEXT: &str = "beamdrop wan x25519 shared secret v1";
+
 #[derive(Debug, Error)]
 pub enum TrustError {
     #[error("Identity error: {0}")]
@@ -31,10 +35,20 @@ pub enum TrustError {
     InvalidPairingUri(String),
     #[error("Invalid 6-digit pairing PIN: {0}")]
     InvalidPinFormat(String),
+    #[error("Cryptographic key derivation error: {0}")]
+    Crypto(String),
 }
 
 fn default_auto_accept() -> bool {
     true
+}
+
+fn default_allow_wan() -> bool {
+    false
+}
+
+fn default_wan_shared_secret() -> [u8; 32] {
+    [0u8; 32]
 }
 
 /// A cryptographically paired device stored in `trusted_peers.json`, keyed by Ed25519 `NodeId`.
@@ -46,6 +60,12 @@ pub struct TrustedPeer {
     pub paired_at_unix: u64,
     #[serde(default = "default_auto_accept")]
     pub auto_accept: bool,
+    /// Explicitly opts this contact into long-distance WAN/relay transfers (defaults to `false`).
+    #[serde(default = "default_allow_wan")]
+    pub allow_wan: bool,
+    /// Locally derived 256-bit secret (Ed25519->X25519 Diffie-Hellman) for daily WAN key rotation.
+    #[serde(default = "default_wan_shared_secret")]
+    pub wan_shared_secret: [u8; 32],
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -77,9 +97,45 @@ pub struct ParsedPairingUri {
 struct TrustStoreInner {
     path: PathBuf,
     peers: BTreeMap<NodeId, TrustedPeer>,
+    local_secret_key: Option<[u8; 32]>,
     active_pairing: Option<PairingSession>,
     last_modified: Option<SystemTime>,
     last_len: Option<u64>,
+}
+
+/// Derives a symmetric 256-bit WAN shared secret locally from the device's Ed25519
+/// secret key and the remote peer's Ed25519 `NodeId` via X25519 Diffie-Hellman.
+pub fn derive_wan_shared_secret(
+    local_secret_key: &[u8; 32],
+    remote_node_id: &NodeId,
+) -> Result<[u8; 32], TrustError> {
+    let local_sk = SigningKey::from_bytes(local_secret_key);
+    let peer_vk = VerifyingKey::from_bytes(remote_node_id.as_bytes())
+        .map_err(|e| TrustError::Crypto(format!("Invalid peer Ed25519 public key: {e}")))?;
+    let peer_mont: MontgomeryPoint = peer_vk.to_montgomery();
+    let raw_shared = peer_mont.mul_clamped(local_sk.to_scalar_bytes()).to_bytes();
+    if raw_shared == [0u8; 32] {
+        return Err(TrustError::Crypto(
+            "X25519 Diffie-Hellman produced a non-contributory shared point".to_string(),
+        ));
+    }
+    Ok(blake3::derive_key(WAN_SHARED_SECRET_CONTEXT, &raw_shared))
+}
+
+fn backfill_missing_wan_secrets(
+    peers: &mut BTreeMap<NodeId, TrustedPeer>,
+    local_secret_key: &[u8; 32],
+) -> bool {
+    let mut updated = false;
+    for (&peer_id, peer) in peers.iter_mut() {
+        if peer.wan_shared_secret == [0u8; 32] {
+            if let Ok(secret) = derive_wan_shared_secret(local_secret_key, &peer_id) {
+                peer.wan_shared_secret = secret;
+                updated = true;
+            }
+        }
+    }
+    updated
 }
 
 /// Persistent trust store backed by `<config_dir>/trusted_peers.json` with one-time PIN pairing
@@ -101,13 +157,36 @@ impl TrustStore {
         path: impl AsRef<Path>,
         local_node_id: NodeId,
     ) -> Result<Self, TrustError> {
+        Self::load_or_create_inner(path, local_node_id, None)
+    }
+
+    /// Loads `trusted_peers.json` using the local [`DeviceIdentity`], automatically deriving
+    /// and backfilling per-peer X25519 `wan_shared_secret` values on load and future pairings.
+    pub fn load_or_create_with_identity(
+        path: impl AsRef<Path>,
+        identity: &DeviceIdentity,
+    ) -> Result<Self, TrustError> {
+        Self::load_or_create_inner(path, identity.node_id, Some(identity.secret_key))
+    }
+
+    fn load_or_create_inner(
+        path: impl AsRef<Path>,
+        local_node_id: NodeId,
+        local_secret_key: Option<[u8; 32]>,
+    ) -> Result<Self, TrustError> {
         let path = path.as_ref().to_path_buf();
-        let peers = if path.exists() {
+        let mut peers = if path.exists() {
             read_peers_file(&path)?
         } else {
             write_peers_file_atomic(&path, &BTreeMap::new())?;
             BTreeMap::new()
         };
+
+        if let Some(secret) = local_secret_key {
+            if backfill_missing_wan_secrets(&mut peers, &secret) {
+                write_peers_file_atomic(&path, &peers)?;
+            }
+        }
 
         let (last_modified, last_len) = file_stamp(&path);
 
@@ -116,11 +195,23 @@ impl TrustStore {
             inner: RwLock::new(TrustStoreInner {
                 path,
                 peers,
+                local_secret_key,
                 active_pairing: None,
                 last_modified,
                 last_len,
             }),
         })
+    }
+
+    /// Attaches the local Ed25519 secret key and backfills missing X25519 secrets in existing entries.
+    pub async fn attach_local_secret(&self, local_secret_key: [u8; 32]) -> Result<(), TrustError> {
+        let mut guard = self.inner.write().await;
+        refresh_if_modified(&mut guard);
+        guard.local_secret_key = Some(local_secret_key);
+        if backfill_missing_wan_secrets(&mut guard.peers, &local_secret_key) {
+            save_inner(&mut guard)?;
+        }
+        Ok(())
     }
 
     /// Returns this node's own Ed25519 `NodeId`.
@@ -144,16 +235,79 @@ impl TrustStore {
         let mut guard = self.inner.write().await;
         refresh_if_modified(&mut guard);
 
+        let existing_allow_wan = guard.peers.get(&node_id).is_some_and(|p| p.allow_wan);
+        let wan_shared_secret = match guard.local_secret_key {
+            Some(secret) => derive_wan_shared_secret(&secret, &node_id)?,
+            None => [0u8; 32],
+        };
+
         let entry = TrustedPeer {
             node_id,
             friendly_alias,
             os_type,
             paired_at_unix: now_unix_secs(),
             auto_accept,
+            allow_wan: existing_allow_wan,
+            wan_shared_secret,
         };
         guard.peers.insert(node_id, entry.clone());
         save_inner(&mut guard)?;
         Ok(entry)
+    }
+
+    /// Updates `allow_wan` for an existing paired device, returning `true` if found.
+    pub async fn set_peer_wan_enabled(
+        &self,
+        node_id: &NodeId,
+        enabled: bool,
+    ) -> Result<bool, TrustError> {
+        let mut guard = self.inner.write().await;
+        refresh_if_modified(&mut guard);
+
+        let local_secret = guard.local_secret_key;
+        if let Some(peer) = guard.peers.get_mut(node_id) {
+            peer.allow_wan = enabled;
+            if peer.wan_shared_secret == [0u8; 32] {
+                if let Some(secret) = local_secret {
+                    peer.wan_shared_secret = derive_wan_shared_secret(&secret, node_id)?;
+                }
+            }
+            save_inner(&mut guard)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Returns `true` if at least one trusted contact has long-distance WAN transfers enabled.
+    pub async fn any_wan_enabled(&self) -> bool {
+        let mut guard = self.inner.write().await;
+        refresh_if_modified(&mut guard);
+        guard.peers.values().any(|peer| peer.allow_wan)
+    }
+
+    /// Returns the peer's WAN shared secret if `node_id` is trusted and has `allow_wan == true`.
+    pub async fn wan_secret_if_allowed(&self, node_id: &NodeId) -> Option<[u8; 32]> {
+        let mut guard = self.inner.write().await;
+        refresh_if_modified(&mut guard);
+        let local_secret = guard.local_secret_key;
+        let (allow_wan, existing_secret) = {
+            let peer = guard.peers.get(node_id)?;
+            (peer.allow_wan, peer.wan_shared_secret)
+        };
+        if !allow_wan {
+            return None;
+        }
+        if existing_secret != [0u8; 32] {
+            return Some(existing_secret);
+        }
+        let secret = local_secret?;
+        let derived = derive_wan_shared_secret(&secret, node_id).ok()?;
+        if let Some(peer) = guard.peers.get_mut(node_id) {
+            peer.wan_shared_secret = derived;
+        }
+        let _ = save_inner(&mut guard);
+        (derived != [0u8; 32]).then_some(derived)
     }
 
     /// Removes a trusted peer by `NodeId` and persists `trusted_peers.json`.
@@ -191,6 +345,22 @@ impl TrustStore {
         let mut guard = self.inner.write().await;
         refresh_if_modified(&mut guard);
         guard.peers.get(node_id).cloned()
+    }
+
+    /// Reads and sorts a snapshot of `trusted_peers.json` from disk without creating files.
+    pub fn read_peers_snapshot(path: impl AsRef<Path>) -> Result<Vec<TrustedPeer>, TrustError> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let peers = read_peers_file(path)?;
+        let mut list: Vec<TrustedPeer> = peers.into_values().collect();
+        list.sort_by(|a, b| {
+            a.friendly_alias
+                .cmp(&b.friendly_alias)
+                .then_with(|| a.node_id.cmp(&b.node_id))
+        });
+        Ok(list)
     }
 
     /// Returns all trusted paired peers sorted by alias then `NodeId`.
@@ -446,7 +616,10 @@ fn write_peers_file_atomic(
 fn refresh_if_modified(inner: &mut TrustStoreInner) {
     let (modified, len) = file_stamp(&inner.path);
     if modified.is_some() && (modified != inner.last_modified || len != inner.last_len) {
-        if let Ok(reloaded) = read_peers_file(&inner.path) {
+        if let Ok(mut reloaded) = read_peers_file(&inner.path) {
+            if let Some(secret) = inner.local_secret_key {
+                backfill_missing_wan_secrets(&mut reloaded, &secret);
+            }
             inner.peers = reloaded;
             inner.last_modified = modified;
             inner.last_len = len;
@@ -575,6 +748,101 @@ mod tests {
             .verify_and_consume_pairing_pin(&expired.pin)
             .await
             .is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_x25519_wan_shared_secret_symmetry_and_persistence() {
+        let dir = std::env::temp_dir().join(format!(
+            "beamdrop_wan_secret_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let path_a = dir.join("peers_a.json");
+        let path_b = dir.join("peers_b.json");
+
+        let alice = DeviceIdentity::generate();
+        let bob = DeviceIdentity::generate();
+
+        let store_a = TrustStore::load_or_create_with_identity(&path_a, &alice)
+            .expect("create store A");
+        let store_b = TrustStore::load_or_create_with_identity(&path_b, &bob)
+            .expect("create store B");
+
+        assert!(!store_a.any_wan_enabled().await);
+        let peer_on_a = store_a
+            .trust_peer(bob.node_id, "Bob-Phone".to_string(), OsType::Android, true)
+            .await
+            .expect("Alice trusts Bob");
+        let peer_on_b = store_b
+            .trust_peer(alice.node_id, "Alice-Mac".to_string(), OsType::MacOS, true)
+            .await
+            .expect("Bob trusts Alice");
+
+        // allow_wan defaults to false and both sides derive identical X25519 shared secrets locally
+        assert!(!peer_on_a.allow_wan);
+        assert!(!peer_on_b.allow_wan);
+        assert_ne!(peer_on_a.wan_shared_secret, [0u8; 32]);
+        assert_eq!(peer_on_a.wan_shared_secret, peer_on_b.wan_shared_secret);
+        assert!(!store_a.any_wan_enabled().await);
+        assert!(store_a.wan_secret_if_allowed(&bob.node_id).await.is_none());
+
+        // Toggling allow_wan ON enables wan_secret_if_allowed and persists across reload
+        assert!(store_a
+            .set_peer_wan_enabled(&bob.node_id, true)
+            .await
+            .unwrap());
+        assert!(store_a.any_wan_enabled().await);
+        assert_eq!(
+            store_a.wan_secret_if_allowed(&bob.node_id).await,
+            Some(peer_on_a.wan_shared_secret)
+        );
+
+        let reloaded_a =
+            TrustStore::load_or_create_with_identity(&path_a, &alice).expect("reload store A");
+        assert!(reloaded_a.any_wan_enabled().await);
+        assert_eq!(
+            reloaded_a.wan_secret_if_allowed(&bob.node_id).await,
+            Some(peer_on_a.wan_shared_secret)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_trusted_peers_backfills_wan_secret_on_load() {
+        let dir = std::env::temp_dir().join(format!(
+            "beamdrop_wan_legacy_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(TRUSTED_PEERS_FILENAME);
+
+        let local = DeviceIdentity::generate();
+        let peer = DeviceIdentity::generate();
+        let legacy_json = serde_json::json!({
+            "peers": {
+                peer.node_id.to_string(): {
+                    "node_id": peer.node_id,
+                    "friendly_alias": "Legacy-PC",
+                    "os_type": "Windows",
+                    "paired_at_unix": 1700000000u64,
+                    "auto_accept": true
+                }
+            }
+        });
+        fs::write(&path, serde_json::to_string_pretty(&legacy_json).unwrap()).unwrap();
+
+        let store = TrustStore::load_or_create_with_identity(&path, &local)
+            .expect("load legacy trusted_peers.json");
+        let loaded = store.get_peer(&peer.node_id).await.expect("loaded peer");
+        assert!(!loaded.allow_wan);
+        assert_eq!(
+            loaded.wan_shared_secret,
+            derive_wan_shared_secret(&local.secret_key, &peer.node_id).unwrap()
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

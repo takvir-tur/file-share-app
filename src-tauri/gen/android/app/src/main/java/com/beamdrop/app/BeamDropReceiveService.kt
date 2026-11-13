@@ -56,6 +56,7 @@ class BeamDropReceiveService : Service() {
 
         isRunning = true
         BeamDropTileService.requestRefresh(this)
+        BeamDropShortcuts.syncShortcuts(this)
         return START_STICKY
     }
 

@@ -3,22 +3,24 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use iroh::endpoint::Connection;
-use iroh::{Endpoint, NodeAddr, NodeId};
+use iroh::endpoint::{Connection, ConnectionType};
+use iroh::{Endpoint, NodeAddr, NodeId, RelayMode};
 use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
+use uuid::Uuid;
 
 use crate::identity::{DeviceIdentity, IdentityError, OsType};
 use crate::protocol::{
     read_frame, write_frame, HelloPayload, Message, PairConfirmPayload, PingPayload, PongPayload,
-    ProtocolError, RejectPayload, BEAMDROP_ALPN, PROTOCOL_VERSION,
+    ProtocolError, RejectPayload, TransferControlPayload, BEAMDROP_ALPN, PROTOCOL_VERSION,
 };
 use crate::transfer::TransferEngine;
 use crate::trust::TrustStore;
@@ -217,15 +219,62 @@ impl PeerTable {
     }
 }
 
+/// Request from a remote peer to resume a paused transfer: `(transfer_id, requester_node_id, reply_tx)`.
+pub type ResumeRequest = (Uuid, NodeId, oneshot::Sender<Result<(), String>>);
+
+/// Channels used to forward out-of-band transfer control requests to `BeamDropNode`.
+#[derive(Clone)]
+pub struct ControlChannels {
+    pub resume_tx: mpsc::UnboundedSender<ResumeRequest>,
+    pub cancel_tx: mpsc::UnboundedSender<(Uuid, Option<String>)>,
+}
+
 /// Zero-config LAN discovery engine and fast-dial peer manager.
 pub struct DiscoveryEngine {
     identity: DeviceIdentity,
-    listen_port: u16,
+    endpoint: Arc<StdRwLock<Option<Endpoint>>>,
+    listen_port: Arc<AtomicU16>,
     mdns: ServiceDaemon,
-    service_fullname: String,
+    service_fullname: StdMutex<String>,
     peer_table: Arc<RwLock<PeerTable>>,
     event_tx: broadcast::Sender<PeerEvent>,
+    transfer_engine: Option<Arc<TransferEngine>>,
+    trust_store: Option<Arc<TrustStore>>,
+    control_channels: Option<ControlChannels>,
+    wan_enabled: Arc<AtomicBool>,
+    reconfigure_lock: Mutex<()>,
+    accept_task: Arc<StdMutex<Option<JoinHandle<()>>>>,
     tasks: Vec<JoinHandle<()>>,
+}
+
+fn build_mdns_service_info(
+    identity: &DeviceIdentity,
+    listen_port: u16,
+) -> Result<ServiceInfo, DiscoveryError> {
+    let node_id_str = identity.node_id.to_string();
+    let short_id = &node_id_str[..10.min(node_id_str.len())];
+    let instance_name = format!("bd-{short_id}");
+    let host_name = format!("beamdrop-{short_id}.local.");
+    let port_str = listen_port.to_string();
+
+    let properties = [
+        ("node_id", node_id_str.as_str()),
+        ("display_name", identity.hostname.as_str()),
+        ("os", identity.os_type.as_str()),
+        ("port", port_str.as_str()),
+    ];
+
+    let mut service_info = ServiceInfo::new(
+        MDNS_SERVICE_TYPE,
+        &instance_name,
+        &host_name,
+        (),
+        listen_port,
+        &properties[..],
+    )?
+    .enable_addr_auto();
+    service_info.set_requires_probe(false);
+    Ok(service_info)
 }
 
 impl DiscoveryEngine {
@@ -261,6 +310,26 @@ impl DiscoveryEngine {
         transfer_engine: Option<Arc<TransferEngine>>,
         trust_store: Option<Arc<TrustStore>>,
     ) -> Result<Self, DiscoveryError> {
+        Self::start_with_handlers(
+            identity,
+            endpoint,
+            known_peers_path,
+            transfer_engine,
+            trust_store,
+            None,
+        )
+        .await
+    }
+
+    /// Starts the discovery engine with optional `TransferEngine`, `TrustStore`, and out-of-band control channels.
+    pub async fn start_with_handlers(
+        identity: DeviceIdentity,
+        endpoint: Endpoint,
+        known_peers_path: Option<PathBuf>,
+        transfer_engine: Option<Arc<TransferEngine>>,
+        trust_store: Option<Arc<TrustStore>>,
+        control_channels: Option<ControlChannels>,
+    ) -> Result<Self, DiscoveryError> {
         let table_path = match known_peers_path {
             Some(p) => p,
             None => PeerTable::default_path()?,
@@ -275,7 +344,18 @@ impl DiscoveryEngine {
             let _ = endpoint.add_node_addr(node_addr);
         }
 
-        let listen_port = endpoint.bound_sockets().0.port();
+        let listen_port_val = endpoint.bound_sockets().0.port();
+        let listen_port = Arc::new(AtomicU16::new(listen_port_val));
+        let shared_endpoint = Arc::new(StdRwLock::new(Some(endpoint.clone())));
+        if let Some(ref tr) = transfer_engine {
+            tr.attach_endpoint(Arc::clone(&shared_endpoint));
+        }
+        let wan_initial = match &trust_store {
+            Some(store) => store.any_wan_enabled().await,
+            None => false,
+        };
+        let wan_enabled = Arc::new(AtomicBool::new(wan_initial));
+
         let peer_table = Arc::new(RwLock::new(initial_table));
         let (event_tx, _) = broadcast::channel(128);
 
@@ -284,54 +364,32 @@ impl DiscoveryEngine {
         let _ = mdns.enable_interface(vec![IfKind::IPv4, IfKind::LoopbackV4]);
         let _ = mdns.set_multicast_loop_v4(true);
 
-        let node_id_str = identity.node_id.to_string();
-        let short_id = &node_id_str[..10.min(node_id_str.len())];
-        let instance_name = format!("bd-{short_id}");
-        let host_name = format!("beamdrop-{short_id}.local.");
-        let port_str = listen_port.to_string();
-
-        let properties = [
-            ("node_id", node_id_str.as_str()),
-            ("display_name", identity.hostname.as_str()),
-            ("os", identity.os_type.as_str()),
-            ("port", port_str.as_str()),
-        ];
-
-        let mut service_info = ServiceInfo::new(
-            MDNS_SERVICE_TYPE,
-            &instance_name,
-            &host_name,
-            (),
-            listen_port,
-            &properties[..],
-        )?
-        .enable_addr_auto();
-        // Disable initial probe delay so service announcements go out immediately (<50ms)
-        service_info.set_requires_probe(false);
-
-        let service_fullname = service_info.get_fullname().to_string();
+        let service_info = build_mdns_service_info(&identity, listen_port_val)?;
+        let service_fullname = StdMutex::new(service_info.get_fullname().to_string());
         mdns.register(service_info)?;
 
         let browse_rx = mdns.browse(MDNS_SERVICE_TYPE)?;
 
-        let mut tasks = Vec::new();
-
-        // Task 1: Listen for incoming QUIC connections (Hello / Ping / Offer / PairRequest handshakes)
-        {
+        // Task 1: Listen for incoming QUIC connections (Hello / Ping / Offer / PairRequest / Control)
+        let accept_handle = {
             let ep = endpoint.clone();
             let id = identity.clone();
             let table = Arc::clone(&peer_table);
             let tx = event_tx.clone();
             let transfer = transfer_engine.clone();
             let trust = trust_store.clone();
-            tasks.push(tokio::spawn(async move {
-                accept_loop(ep, id, listen_port, table, tx, transfer, trust).await;
-            }));
-        }
+            let ctrl = control_channels.clone();
+            tokio::spawn(async move {
+                accept_loop(ep, id, listen_port_val, table, tx, transfer, trust, ctrl).await;
+            })
+        };
+        let accept_task = Arc::new(StdMutex::new(Some(accept_handle)));
+
+        let mut tasks = Vec::new();
 
         // Task 2: Browse mDNS events and update peer table + broadcast channel
         {
-            let ep = endpoint.clone();
+            let ep = Arc::clone(&shared_endpoint);
             let local_node_id = identity.node_id;
             let table = Arc::clone(&peer_table);
             let tx = event_tx.clone();
@@ -340,24 +398,32 @@ impl DiscoveryEngine {
             }));
         }
 
-        // Task 3: Fast-path <50ms direct dial probe of cached peers from known_peers.json
+        // Task 3: Fast-path direct dial probe of cached peers + periodic fallback when mDNS drops
         {
-            let ep = endpoint.clone();
+            let ep = Arc::clone(&shared_endpoint);
             let id = identity.clone();
+            let port_ref = Arc::clone(&listen_port);
             let table = Arc::clone(&peer_table);
             let tx = event_tx.clone();
             tasks.push(tokio::spawn(async move {
-                probe_cached_peers(ep, id, listen_port, table, tx).await;
+                probe_cached_peers_loop(ep, id, port_ref, table, tx).await;
             }));
         }
 
         Ok(Self {
             identity,
+            endpoint: shared_endpoint,
             listen_port,
             mdns,
             service_fullname,
             peer_table,
             event_tx,
+            transfer_engine,
+            trust_store,
+            control_channels,
+            wan_enabled,
+            reconfigure_lock: Mutex::new(()),
+            accept_task,
             tasks,
         })
     }
@@ -367,9 +433,112 @@ impl DiscoveryEngine {
         self.event_tx.subscribe()
     }
 
+    /// Returns a clone of the currently active `iroh::Endpoint`.
+    pub fn endpoint(&self) -> Endpoint {
+        self.endpoint
+            .read()
+            .expect("endpoint rwlock")
+            .clone()
+            .expect("endpoint should be initialized outside WAN reconfiguration")
+    }
+
+    /// Returns the shared `Endpoint` lock handle used across discovery and transfer engines.
+    pub fn shared_endpoint(&self) -> Arc<StdRwLock<Option<Endpoint>>> {
+        Arc::clone(&self.endpoint)
+    }
+
+    /// Returns whether global Pkarr/DNS discovery and Iroh relay transport are currently enabled.
+    pub fn is_wan_transport_enabled(&self) -> bool {
+        self.wan_enabled.load(Ordering::Acquire)
+    }
+
+    /// Reconfigures the underlying `iroh::Endpoint` to enable (`RelayMode::Default` + `discovery_n0`)
+    /// or completely disable (`RelayMode::Disabled` + `clear_discovery`) global discovery and relay.
+    pub async fn reconfigure_wan_transport(&self, enabled: bool) -> Result<(), DiscoveryError> {
+        let _guard = self.reconfigure_lock.lock().await;
+        if self.wan_enabled.load(Ordering::Acquire) == enabled {
+            return Ok(());
+        }
+
+        let known_nodes = self.peer_table.read().await.cached_node_addrs();
+        let current_port = self.listen_port.load(Ordering::Relaxed);
+
+        let prev_accept = { self.accept_task.lock().expect("accept_task mutex").take() };
+        if let Some(handle) = prev_accept {
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        // Remove and drop the old Endpoint completely before binding so the OS frees `current_port`.
+        let prev_ep = { self.endpoint.write().expect("endpoint rwlock").take() };
+        if let Some(old_ep) = prev_ep {
+            old_ep.close().await;
+            drop(old_ep);
+            tokio::task::yield_now().await;
+        }
+
+        let mut bound_ep = None;
+        for _ in 0..8 {
+            if let Ok(ep) = build_iroh_endpoint_with_wan(
+                &self.identity,
+                current_port,
+                known_nodes.clone(),
+                enabled,
+            )
+            .await
+            {
+                bound_ep = Some(ep);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(35)).await;
+        }
+
+        let new_ep = match bound_ep {
+            Some(ep) => ep,
+            None => {
+                build_iroh_endpoint_with_wan(&self.identity, 0, known_nodes, enabled).await?
+            }
+        };
+
+        let new_port = new_ep.bound_sockets().0.port();
+        self.listen_port.store(new_port, Ordering::Relaxed);
+        if new_port != current_port {
+            warn!(
+                old_port = current_port,
+                new_port,
+                "BeamDrop QUIC port changed during WAN endpoint reconfiguration; refreshing mDNS"
+            );
+            let old_name = { self.service_fullname.lock().expect("fullname mutex").clone() };
+            if let Ok(rx) = self.mdns.unregister(&old_name) {
+                let _ = tokio::time::timeout(Duration::from_millis(150), rx.recv_async()).await;
+            }
+            if let Ok(info) = build_mdns_service_info(&self.identity, new_port) {
+                *self.service_fullname.lock().expect("fullname mutex") =
+                    info.get_fullname().to_string();
+                let _ = self.mdns.register(info);
+            }
+        }
+        *self.endpoint.write().expect("endpoint rwlock") = Some(new_ep.clone());
+
+        let new_accept = {
+            let id = self.identity.clone();
+            let table = Arc::clone(&self.peer_table);
+            let tx = self.event_tx.clone();
+            let transfer = self.transfer_engine.clone();
+            let trust = self.trust_store.clone();
+            let ctrl = self.control_channels.clone();
+            tokio::spawn(async move {
+                accept_loop(new_ep, id, new_port, table, tx, transfer, trust, ctrl).await;
+            })
+        };
+        *self.accept_task.lock().expect("accept_task mutex") = Some(new_accept);
+        self.wan_enabled.store(enabled, Ordering::Release);
+        Ok(())
+    }
+
     /// Returns the local listening UDP/QUIC port.
     pub fn listen_port(&self) -> u16 {
-        self.listen_port
+        self.listen_port.load(Ordering::Relaxed)
     }
 
     /// Returns a handle to the shared `PeerTable`.
@@ -387,28 +556,92 @@ impl DiscoveryEngine {
         self.peer_table.read().await.all_peers()
     }
 
+    /// Triggers an immediate direct QUIC probe across all cached peers (useful when Android
+    /// drops mDNS multicast or after app foregrounding).
+    pub async fn probe_cached_peers_now(&self) {
+        let ep = self.endpoint();
+        probe_peers_once(
+            &ep,
+            &self.identity,
+            self.listen_port(),
+            &self.peer_table,
+            &self.event_tx,
+            false,
+            Duration::from_millis(1200),
+        )
+        .await;
+    }
+
     /// Dials a known peer directly using its cached local `SocketAddr` and `NodeId`
-    /// (completing in <50ms on LAN without waiting for mDNS or relay discovery).
+    /// (completing in <50ms on LAN without waiting for mDNS or relay discovery), falling
+    /// back to global Iroh node/relay resolution ONLY when `allow_wan == true` on the contact.
     pub async fn dial_peer(
         &self,
         endpoint: &Endpoint,
         node_id: NodeId,
     ) -> Result<Connection, DiscoveryError> {
-        let node_addr = {
+        let maybe_peer = {
             let table = self.peer_table.read().await;
-            let peer = table
-                .get(&node_id)
-                .ok_or(DiscoveryError::UnknownPeer(node_id))?;
-            peer.to_node_addr()
+            table.get(&node_id).cloned()
+        };
+        let wan_allowed = match &self.trust_store {
+            Some(store) => store.wan_secret_if_allowed(&node_id).await.is_some(),
+            None => false,
         };
 
-        endpoint
-            .add_node_addr(node_addr.clone())
-            .map_err(DiscoveryError::Iroh)?;
-        let conn = endpoint
-            .connect(node_addr, BEAMDROP_ALPN)
-            .await
-            .map_err(DiscoveryError::Iroh)?;
+        let (conn, connected_via_lan) = if let Some(peer) = maybe_peer {
+            let node_addr = peer.to_node_addr();
+            endpoint
+                .add_node_addr(node_addr.clone())
+                .map_err(DiscoveryError::Iroh)?;
+            if wan_allowed {
+                match tokio::time::timeout(
+                    Duration::from_millis(2200),
+                    endpoint.connect(node_addr, BEAMDROP_ALPN),
+                )
+                .await
+                {
+                    Ok(Ok(conn)) => (conn, true),
+                    Ok(Err(_)) | Err(_) => {
+                        let wan_conn = endpoint
+                            .connect(NodeAddr::new(node_id), BEAMDROP_ALPN)
+                            .await
+                            .map_err(DiscoveryError::Iroh)?;
+                        (wan_conn, is_endpoint_connection_lan(endpoint, node_id))
+                    }
+                }
+            } else {
+                let conn = endpoint
+                    .connect(node_addr, BEAMDROP_ALPN)
+                    .await
+                    .map_err(DiscoveryError::Iroh)?;
+                (conn, true)
+            }
+        } else if wan_allowed {
+            let wan_conn = endpoint
+                .connect(NodeAddr::new(node_id), BEAMDROP_ALPN)
+                .await
+                .map_err(DiscoveryError::Iroh)?;
+            (wan_conn, is_endpoint_connection_lan(endpoint, node_id))
+        } else {
+            return Err(DiscoveryError::Iroh(anyhow::anyhow!(
+                "Peer {node_id} is not reachable on local LAN and long-distance transfers are disabled for this contact"
+            )));
+        };
+
+        if connected_via_lan {
+            let mut table = self.peer_table.write().await;
+            if let Some(mut refreshed) = table.get(&node_id).cloned() {
+                refreshed.online = true;
+                refreshed.last_seen_unix_ms = now_unix_ms();
+                if let Ok((saved, should_notify)) = table.upsert(refreshed, None) {
+                    if should_notify {
+                        let _ = self.event_tx.send(PeerEvent::Discovered(saved));
+                    }
+                }
+            }
+        }
+
         Ok(conn)
     }
 
@@ -440,7 +673,7 @@ impl DiscoveryEngine {
             node_id: self.identity.node_id,
             display_name: self.identity.hostname.clone(),
             os_type: self.identity.os_type,
-            listen_port: self.listen_port,
+            listen_port: self.listen_port(),
         });
         write_frame(&mut send, &hello).await?;
         let _ = send.finish();
@@ -498,8 +731,13 @@ impl DiscoveryEngine {
 
     /// Gracefully unregisters the mDNS service and stops background tasks.
     pub async fn shutdown(mut self) {
-        if let Ok(rx) = self.mdns.unregister(&self.service_fullname) {
+        let fullname = { self.service_fullname.lock().expect("fullname mutex").clone() };
+        if let Ok(rx) = self.mdns.unregister(&fullname) {
             let _ = tokio::time::timeout(Duration::from_millis(250), rx.recv_async()).await;
+        }
+        let prev_accept = { self.accept_task.lock().expect("accept_task mutex").take() };
+        if let Some(handle) = prev_accept {
+            handle.abort();
         }
         for handle in self.tasks.drain(..) {
             handle.abort();
@@ -510,6 +748,11 @@ impl DiscoveryEngine {
 
 impl Drop for DiscoveryEngine {
     fn drop(&mut self) {
+        if let Ok(mut guard) = self.accept_task.lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
         for handle in &self.tasks {
             handle.abort();
         }
@@ -519,7 +762,7 @@ impl Drop for DiscoveryEngine {
 async fn mdns_browse_loop(
     browse_rx: mdns_sd::Receiver<ServiceEvent>,
     local_node_id: NodeId,
-    endpoint: Endpoint,
+    endpoint: Arc<StdRwLock<Option<Endpoint>>>,
     peer_table: Arc<RwLock<PeerTable>>,
     event_tx: broadcast::Sender<PeerEvent>,
 ) {
@@ -533,7 +776,10 @@ async fn mdns_browse_loop(
                         addr = %peer.addr,
                         "mDNS resolved BeamDrop peer"
                     );
-                    let _ = endpoint.add_node_addr(peer.to_node_addr());
+                    let maybe_ep = { endpoint.read().expect("endpoint rwlock").clone() };
+                    if let Some(ep) = maybe_ep {
+                        let _ = ep.add_node_addr(peer.to_node_addr());
+                    }
                     let mut table = peer_table.write().await;
                     if let Ok((saved, should_notify)) = table.upsert(peer, Some(info.get_fullname()))
                     {
@@ -630,27 +876,84 @@ fn select_best_ip(addrs: &std::collections::HashSet<IpAddr>) -> Option<IpAddr> {
     None
 }
 
-async fn probe_cached_peers(
-    endpoint: Endpoint,
+async fn probe_cached_peers_loop(
+    endpoint: Arc<StdRwLock<Option<Endpoint>>>,
     identity: DeviceIdentity,
-    listen_port: u16,
+    listen_port: Arc<AtomicU16>,
     peer_table: Arc<RwLock<PeerTable>>,
     event_tx: broadcast::Sender<PeerEvent>,
+) {
+    // Immediate fast probe on startup for <50ms cached peer discovery
+    let initial_ep = { endpoint.read().expect("endpoint rwlock").clone() };
+    if let Some(ep) = initial_ep {
+        let port = listen_port.load(Ordering::Relaxed);
+        probe_peers_once(
+            &ep,
+            &identity,
+            port,
+            &peer_table,
+            &event_tx,
+            false,
+            Duration::from_millis(800),
+        )
+        .await;
+    }
+
+    // Periodic fallback every 5s for offline/stale peers when mDNS multicast is dropped
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let current_ep = { endpoint.read().expect("endpoint rwlock").clone() };
+        if let Some(ep) = current_ep {
+            let port = listen_port.load(Ordering::Relaxed);
+            probe_peers_once(
+                &ep,
+                &identity,
+                port,
+                &peer_table,
+                &event_tx,
+                true,
+                Duration::from_millis(1200),
+            )
+            .await;
+        }
+    }
+}
+
+async fn probe_peers_once(
+    endpoint: &Endpoint,
+    identity: &DeviceIdentity,
+    listen_port: u16,
+    peer_table: &Arc<RwLock<PeerTable>>,
+    event_tx: &broadcast::Sender<PeerEvent>,
+    only_offline_or_stale: bool,
+    timeout: Duration,
 ) {
     let cached = {
         let table = peer_table.read().await;
         table.all_peers()
     };
 
+    let now_ms = now_unix_ms();
+    let mut handles = Vec::new();
+
     for peer in cached {
         if peer.node_id == identity.node_id {
             continue;
         }
+        if only_offline_or_stale
+            && peer.online
+            && now_ms.saturating_sub(peer.last_seen_unix_ms) < 15_000
+        {
+            continue;
+        }
         let ep = endpoint.clone();
         let id = identity.clone();
-        let table = Arc::clone(&peer_table);
+        let table = Arc::clone(peer_table);
         let tx = event_tx.clone();
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             let probe_fut = async {
                 let node_addr = peer.to_node_addr();
                 let _ = ep.add_node_addr(node_addr.clone());
@@ -670,9 +973,7 @@ async fn probe_cached_peers(
                 anyhow::Ok(resp)
             };
 
-            if let Ok(Ok(Message::Hello(remote))) =
-                tokio::time::timeout(Duration::from_millis(400), probe_fut).await
-            {
+            if let Ok(Ok(Message::Hello(remote))) = tokio::time::timeout(timeout, probe_fut).await {
                 let updated = PeerInfo {
                     node_id: remote.node_id,
                     display_name: remote.display_name,
@@ -689,7 +990,11 @@ async fn probe_cached_peers(
                     }
                 }
             }
-        });
+        }));
+    }
+
+    for h in handles {
+        let _ = h.await;
     }
 }
 
@@ -701,6 +1006,7 @@ async fn accept_loop(
     event_tx: broadcast::Sender<PeerEvent>,
     transfer_engine: Option<Arc<TransferEngine>>,
     trust_store: Option<Arc<TrustStore>>,
+    control_channels: Option<ControlChannels>,
 ) {
     while let Some(incoming) = endpoint.accept().await {
         let remote_addr = incoming.remote_address();
@@ -711,6 +1017,7 @@ async fn accept_loop(
         let ep = endpoint.clone();
         let transfer = transfer_engine.clone();
         let trust_store = trust_store.clone();
+        let ctrl_ch = control_channels.clone();
 
         tokio::spawn(async move {
             let connecting = match incoming.accept() {
@@ -912,6 +1219,72 @@ async fn accept_loop(
                             }
                         }
                     }
+                    Message::Pause(ctrl) => {
+                        if let Some(ref engine) = transfer {
+                            let _ = engine.handle_remote_control(Message::Pause(ctrl)).await;
+                        }
+                        let _ = send.finish();
+                    }
+                    Message::Cancel(ctrl) => {
+                        let handled = if let Some(ref engine) = transfer {
+                            engine
+                                .handle_remote_control(Message::Cancel(ctrl.clone()))
+                                .await
+                        } else {
+                            false
+                        };
+                        if !handled {
+                            if let Some(ref ch) = ctrl_ch {
+                                let _ = ch.cancel_tx.send((ctrl.transfer_id, ctrl.reason));
+                            }
+                        }
+                        let _ = send.finish();
+                    }
+                    Message::Resume(req) => {
+                        let requester = match conn.remote_node_id() {
+                            Ok(nid) => nid,
+                            Err(e) => {
+                                let reject = Message::Reject(RejectPayload {
+                                    transfer_id: req.transfer_id,
+                                    reason: Some(format!("Unauthenticated QUIC peer: {e}")),
+                                });
+                                let _ = write_frame(&mut send, &reject).await;
+                                let _ = send.finish();
+                                continue;
+                            }
+                        };
+
+                        let outcome = if let Some(ref ch) = ctrl_ch {
+                            let (reply_tx, reply_rx) = oneshot::channel();
+                            if ch.resume_tx.send((req.transfer_id, requester, reply_tx)).is_ok() {
+                                reply_rx
+                                    .await
+                                    .unwrap_or_else(|_| Err("Node resume handler closed".into()))
+                            } else {
+                                Err("Node resume handler unavailable".into())
+                            }
+                        } else {
+                            Err("Remote resume is not enabled on this node".into())
+                        };
+
+                        match outcome {
+                            Ok(()) => {
+                                let ack = Message::Resume(TransferControlPayload {
+                                    transfer_id: req.transfer_id,
+                                    reason: None,
+                                });
+                                let _ = write_frame(&mut send, &ack).await;
+                            }
+                            Err(reason) => {
+                                let reject = Message::Reject(RejectPayload {
+                                    transfer_id: req.transfer_id,
+                                    reason: Some(reason),
+                                });
+                                let _ = write_frame(&mut send, &reject).await;
+                            }
+                        }
+                        let _ = send.finish();
+                    }
                     _ => {
                         break;
                     }
@@ -921,11 +1294,62 @@ async fn accept_loop(
     }
 }
 
-/// Builds a configured `iroh::Endpoint` using the persistent `DeviceIdentity` Ed25519 keypair.
+/// Returns `true` if `ip` is strictly a local LAN or loopback address
+/// (`192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12`, `169.254.0.0/16`, `127.0.0.0/8`,
+/// IPv6 `::1`, link-local `fe80::/10`, unique-local `fc00::/7`, or IPv4-mapped LAN IPv6).
+pub fn is_local_lan_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return mapped.is_private() || mapped.is_loopback() || mapped.is_link_local();
+            }
+            let seg0 = v6.segments()[0];
+            v6.is_loopback()
+                || (seg0 & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique local
+        }
+    }
+}
+
+/// Inspects the `Endpoint`'s active path for `remote_node_id` and returns `true` only when the
+/// connection is verified as a local LAN / loopback direct UDP connection without relay usage.
+pub fn is_endpoint_connection_lan(endpoint: &Endpoint, remote_node_id: NodeId) -> bool {
+    match endpoint.conn_type(remote_node_id) {
+        Ok(watcher) => match watcher.get() {
+            Ok(ConnectionType::Direct(addr)) => is_local_lan_ip(&addr.ip()),
+            Ok(ConnectionType::Relay(_)) | Ok(ConnectionType::Mixed(_, _)) => false,
+            Ok(ConnectionType::None) | Err(_) => {
+                if let Some(info) = endpoint.remote_info(remote_node_id) {
+                    info.relay_url.is_none()
+                        && !info.addrs.is_empty()
+                        && info.addrs.iter().all(|a| is_local_lan_ip(&a.addr.ip()))
+                } else {
+                    false
+                }
+            }
+        },
+        Err(_) => false,
+    }
+}
+
+/// Builds a configured `iroh::Endpoint` using the persistent `DeviceIdentity` Ed25519 keypair
+/// with global discovery and relay disabled (`RelayMode::Disabled`, strictly LAN-only).
 pub async fn build_iroh_endpoint(
     identity: &DeviceIdentity,
     bind_port: u16,
     known_nodes: Vec<NodeAddr>,
+) -> Result<Endpoint, DiscoveryError> {
+    build_iroh_endpoint_with_wan(identity, bind_port, known_nodes, false).await
+}
+
+/// Builds a configured `iroh::Endpoint`, enabling global Pkarr/DNS discovery (`discovery_n0`)
+/// and Iroh relays (`RelayMode::Default`) strictly when `wan_enabled` is `true`.
+pub async fn build_iroh_endpoint_with_wan(
+    identity: &DeviceIdentity,
+    bind_port: u16,
+    known_nodes: Vec<NodeAddr>,
+    wan_enabled: bool,
 ) -> Result<Endpoint, DiscoveryError> {
     let bind_v4 = std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, bind_port);
     let mut transport_config = iroh::endpoint::TransportConfig::default();
@@ -934,15 +1358,23 @@ pub async fn build_iroh_endpoint(
     transport_config.receive_window(iroh::endpoint::VarInt::from_u32(4 * 1024 * 1024));
     transport_config.send_window(4 * 1024 * 1024);
 
-    let endpoint = Endpoint::builder()
+    let mut builder = Endpoint::builder()
         .secret_key(identity.iroh_secret_key())
         .alpns(vec![BEAMDROP_ALPN.to_vec()])
         .bind_addr_v4(bind_v4)
         .known_nodes(known_nodes)
         .transport_config(transport_config)
-        .bind()
-        .await
-        .map_err(DiscoveryError::Iroh)?;
+        .clear_discovery();
+
+    builder = if wan_enabled {
+        builder
+            .relay_mode(RelayMode::Default)
+            .discovery_n0()
+    } else {
+        builder.relay_mode(RelayMode::Disabled)
+    };
+
+    let endpoint = builder.bind().await.map_err(DiscoveryError::Iroh)?;
     Ok(endpoint)
 }
 

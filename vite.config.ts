@@ -4,6 +4,9 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   clearScreen: false,
+  esbuild: {
+    legalComments: "none",
+  },
   build: {
     target: "esnext",
   },

@@ -3,14 +3,19 @@ use std::fs;
 use std::io::SeekFrom;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    ChaCha20Poly1305, Nonce,
+};
 #[cfg(not(target_os = "android"))]
 use directories::UserDirs;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::NodeId;
+use iroh::{Endpoint, NodeId};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -20,10 +25,11 @@ use uuid::Uuid;
 
 #[cfg(not(target_os = "android"))]
 use crate::identity::DeviceIdentity;
+use crate::discovery::is_endpoint_connection_lan;
 use crate::protocol::{
     read_frame, transfer_stream_id, write_frame, AcceptPayload, AcceptedFileResume, ChunkRange,
     CompletePayload, FileHashEntry, FileOfferEntry, Message, OfferPayload, ProtocolError,
-    RejectPayload,
+    RejectPayload, TransferControlPayload,
 };
 use crate::trust::TrustStore;
 
@@ -45,6 +51,17 @@ pub const UNI_CHUNK_HEADER_LEN: usize = 24;
 
 /// Default timeout before rejecting unapproved incoming offers from untrusted peers.
 pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 96-bit ChaCha20-Poly1305 nonce length prepended to each encrypted WAN chunk.
+pub const WAN_CHUNK_NONCE_LEN: usize = 12;
+
+/// 128-bit Poly1305 authentication tag appended to each encrypted WAN chunk.
+pub const WAN_CHUNK_TAG_LEN: usize = 16;
+
+/// Total per-chunk wire overhead (`12B nonce + 16B tag`) added exclusively on WAN transfers.
+pub const WAN_CHUNK_OVERHEAD: usize = WAN_CHUNK_NONCE_LEN + WAN_CHUNK_TAG_LEN;
+
+const WAN_DAILY_KEY_CONTEXT: &str = "beamdrop wan daily chacha20poly1305 key v1";
 
 #[derive(Debug, Error)]
 pub enum TransferError {
@@ -73,6 +90,14 @@ pub enum TransferError {
     },
     #[error("BLAKE3 integrity verification failed for file '{relative_path}'")]
     IntegrityMismatch { relative_path: String },
+    #[error("WAN encryption/decryption error: {0}")]
+    WanCrypto(String),
+    #[error("Long-distance WAN transfer blocked: {0}")]
+    WanDisallowed(String),
+    #[error("Transfer {0} paused")]
+    Paused(Uuid),
+    #[error("Transfer {0} cancelled")]
+    Cancelled(Uuid),
 }
 
 /// 24-byte big-endian chunk header written on unidirectional QUIC streams.
@@ -138,6 +163,15 @@ pub struct TransferSummary {
 /// Events published by `TransferEngine` over a `tokio::sync::broadcast` channel.
 #[derive(Debug, Clone)]
 pub enum TransferEvent {
+    Started {
+        transfer_id: Uuid,
+        peer_node_id: NodeId,
+        peer_name: String,
+        file_name: String,
+        files: usize,
+        total_bytes: u64,
+        bytes_skipped_resumed: u64,
+    },
     OfferReceived {
         transfer_id: Uuid,
         sender_name: String,
@@ -159,6 +193,14 @@ pub enum TransferEvent {
         total_bytes: u64,
     },
     Progress(TransferProgress),
+    Paused {
+        transfer_id: Uuid,
+        reason: Option<String>,
+    },
+    Cancelled {
+        transfer_id: Uuid,
+        reason: Option<String>,
+    },
     Completed {
         transfer_id: Uuid,
         files: usize,
@@ -443,19 +485,250 @@ struct IncomingChunk {
     data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlAction {
+    Pause,
+    Cancel,
+}
+
+#[derive(Debug, Clone)]
+struct ControlSignal {
+    action: ControlAction,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterStop {
+    Running,
+    Pause,
+    Cancel,
+}
+
+#[derive(Debug, Clone)]
+pub struct PartialFilePaths {
+    pub part_path: PathBuf,
+    pub resume_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct PausedIncomingInfo {
+    pub sender_node_id: NodeId,
+    pub partial_files: Vec<PartialFilePaths>,
+}
+
+/// Returns the current UTC day index (`unix_timestamp / 86400`).
+pub fn current_utc_day() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0)
+}
+
+/// Derives a 256-bit daily-rotating key from `wan_shared_secret` and `utc_day`.
+pub fn derive_daily_wan_key(wan_shared_secret: &[u8; 32], utc_day: u64) -> [u8; 32] {
+    let mut material = [0u8; 40];
+    material[..32].copy_from_slice(wan_shared_secret);
+    material[32..40].copy_from_slice(&utc_day.to_be_bytes());
+    blake3::derive_key(WAN_DAILY_KEY_CONTEXT, &material)
+}
+
+fn build_wan_chunk_aad(transfer_id: Uuid, file_index: u32, byte_offset: u64) -> [u8; 28] {
+    let mut aad = [0u8; 28];
+    aad[..16].copy_from_slice(transfer_id.as_bytes());
+    aad[16..20].copy_from_slice(&file_index.to_be_bytes());
+    aad[20..28].copy_from_slice(&byte_offset.to_be_bytes());
+    aad
+}
+
+struct WanCipherState {
+    cached_day: u64,
+    today_cipher: ChaCha20Poly1305,
+    yesterday_cipher: Option<ChaCha20Poly1305>,
+}
+
+impl WanCipherState {
+    fn for_day(secret: &[u8; 32], utc_day: u64) -> Self {
+        let today_key = derive_daily_wan_key(secret, utc_day);
+        let today_cipher = ChaCha20Poly1305::new((&today_key).into());
+        let yesterday_cipher = utc_day.checked_sub(1).map(|prev| {
+            let prev_key = derive_daily_wan_key(secret, prev);
+            ChaCha20Poly1305::new((&prev_key).into())
+        });
+        Self {
+            cached_day: utc_day,
+            today_cipher,
+            yesterday_cipher,
+        }
+    }
+}
+
+/// Automatic daily-rotating ChaCha20-Poly1305 cipher context used strictly for WAN chunks.
+/// Accepts keys derived from both `day` and `day - 1` across UTC midnight boundaries.
+pub struct WanCipherContext {
+    transfer_id: Uuid,
+    wan_shared_secret: [u8; 32],
+    day_override: Option<u64>,
+    state: StdMutex<WanCipherState>,
+}
+
+impl WanCipherContext {
+    pub fn new(transfer_id: Uuid, wan_shared_secret: [u8; 32]) -> Self {
+        let day = current_utc_day();
+        Self {
+            transfer_id,
+            wan_shared_secret,
+            day_override: None,
+            state: StdMutex::new(WanCipherState::for_day(&wan_shared_secret, day)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_utc_day(
+        transfer_id: Uuid,
+        wan_shared_secret: [u8; 32],
+        utc_day: u64,
+    ) -> Self {
+        Self {
+            transfer_id,
+            wan_shared_secret,
+            day_override: Some(utc_day),
+            state: StdMutex::new(WanCipherState::for_day(&wan_shared_secret, utc_day)),
+        }
+    }
+
+    fn effective_day(&self) -> u64 {
+        self.day_override.unwrap_or_else(current_utc_day)
+    }
+
+    /// Encrypts `plaintext` into `[12-byte random nonce | ChaCha20-Poly1305 ciphertext + 16-byte tag]`.
+    pub fn encrypt_chunk(
+        &self,
+        file_index: u32,
+        byte_offset: u64,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, TransferError> {
+        let day = self.effective_day();
+        let aad = build_wan_chunk_aad(self.transfer_id, file_index, byte_offset);
+        let mut nonce_bytes = [0u8; WAN_CHUNK_NONCE_LEN];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+
+        let mut guard = self.state.lock().expect("wan cipher mutex");
+        if guard.cached_day != day {
+            *guard = WanCipherState::for_day(&self.wan_shared_secret, day);
+        }
+
+        let ciphertext = guard
+            .today_cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| TransferError::WanCrypto("AEAD chunk encryption failed".to_string()))?;
+
+        let mut out = Vec::with_capacity(WAN_CHUNK_NONCE_LEN + ciphertext.len());
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    /// Decrypts `[12-byte nonce | ciphertext + tag]`, accepting keys for `day` and `day - 1`.
+    pub fn decrypt_chunk(
+        &self,
+        file_index: u32,
+        byte_offset: u64,
+        encrypted: &[u8],
+    ) -> Result<Vec<u8>, TransferError> {
+        if encrypted.len() <= WAN_CHUNK_OVERHEAD {
+            return Err(TransferError::WanCrypto(format!(
+                "Encrypted WAN chunk too short ({} bytes)",
+                encrypted.len()
+            )));
+        }
+
+        let day = self.effective_day();
+        let (nonce_bytes, ct) = encrypted.split_at(WAN_CHUNK_NONCE_LEN);
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let aad = build_wan_chunk_aad(self.transfer_id, file_index, byte_offset);
+        let mut guard = self.state.lock().expect("wan cipher mutex");
+        if guard.cached_day != day {
+            *guard = WanCipherState::for_day(&self.wan_shared_secret, day);
+        }
+
+        if let Ok(plaintext) = guard
+            .today_cipher
+            .decrypt(nonce, Payload { msg: ct, aad: &aad })
+        {
+            return Ok(plaintext);
+        }
+        if let Some(ref prev_cipher) = guard.yesterday_cipher {
+            if let Ok(plaintext) = prev_cipher.decrypt(nonce, Payload { msg: ct, aad: &aad }) {
+                return Ok(plaintext);
+            }
+        }
+
+        Err(TransferError::WanCrypto(
+            "WAN payload authentication failed (wrong contact secret or expired daily key)"
+                .to_string(),
+        ))
+    }
+}
+
 struct ActiveIncomingTransfer {
     conn_stable_id: usize,
     chunk_tx: mpsc::Sender<IncomingChunk>,
-    cancel_tx: watch::Sender<bool>,
+    stop_tx: watch::Sender<WriterStop>,
+    wan_cipher: Option<Arc<WanCipherContext>>,
+}
+
+struct ControlMapGuard {
+    transfer_id: Uuid,
+    active_controls: Arc<RwLock<HashMap<Uuid, watch::Sender<Option<ControlSignal>>>>>,
+    disarmed: bool,
+}
+
+impl ControlMapGuard {
+    fn new(
+        transfer_id: Uuid,
+        active_controls: Arc<RwLock<HashMap<Uuid, watch::Sender<Option<ControlSignal>>>>>,
+    ) -> Self {
+        Self {
+            transfer_id,
+            active_controls,
+            disarmed: false,
+        }
+    }
+
+    async fn remove_now(&mut self) {
+        if !self.disarmed {
+            self.disarmed = true;
+            self.active_controls.write().await.remove(&self.transfer_id);
+        }
+    }
+}
+
+impl Drop for ControlMapGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            if let Ok(mut guard) = self.active_controls.try_write() {
+                guard.remove(&self.transfer_id);
+            }
+        }
+    }
 }
 
 /// Engine managing bounded-memory parallel QUIC transfers, resume bitmaps, and BLAKE3 verification.
 pub struct TransferEngine {
     download_dir: PathBuf,
     trust_store: Option<Arc<TrustStore>>,
+    shared_endpoint: StdRwLock<Option<Arc<StdRwLock<Option<Endpoint>>>>>,
     pending_approvals: Arc<Mutex<HashMap<Uuid, oneshot::Sender<bool>>>>,
     approval_timeout: RwLock<Duration>,
     active_incoming: Arc<RwLock<HashMap<u64, ActiveIncomingTransfer>>>,
+    active_controls: Arc<RwLock<HashMap<Uuid, watch::Sender<Option<ControlSignal>>>>>,
+    paused_incoming: Arc<RwLock<HashMap<Uuid, PausedIncomingInfo>>>,
     completed_files: Arc<RwLock<HashMap<Uuid, Vec<PathBuf>>>>,
     event_tx: broadcast::Sender<TransferEvent>,
 }
@@ -481,12 +754,37 @@ impl TransferEngine {
         Ok(Self {
             download_dir: dir,
             trust_store,
+            shared_endpoint: StdRwLock::new(None),
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
             approval_timeout: RwLock::new(DEFAULT_APPROVAL_TIMEOUT),
             active_incoming: Arc::new(RwLock::new(HashMap::new())),
+            active_controls: Arc::new(RwLock::new(HashMap::new())),
+            paused_incoming: Arc::new(RwLock::new(HashMap::new())),
             completed_files: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
         })
+    }
+
+    /// Attaches the node's shared `iroh::Endpoint` reference so transfers can distinguish
+    /// direct local LAN paths from WAN/relay paths without extra round-trips.
+    pub fn attach_endpoint(&self, endpoint: Arc<StdRwLock<Option<Endpoint>>>) {
+        *self.shared_endpoint.write().expect("shared_endpoint rwlock") = Some(endpoint);
+    }
+
+    fn is_connection_lan(&self, remote_node_id: NodeId) -> bool {
+        let maybe_ep_lock = self
+            .shared_endpoint
+            .read()
+            .expect("shared_endpoint rwlock")
+            .clone();
+        match maybe_ep_lock {
+            Some(ep_lock) => match ep_lock.read().expect("endpoint rwlock").as_ref() {
+                Some(ep) => is_endpoint_connection_lan(ep, remote_node_id),
+                None => false,
+            },
+            // Standalone unit/integration harnesses without DiscoveryEngine run directly on localhost LAN.
+            None => true,
+        }
     }
 
     /// Configures the approval wait timeout for untrusted offers (defaults to 60 seconds).
@@ -530,6 +828,117 @@ impl TransferEngine {
     /// Subscribes to incoming/outgoing `TransferEvent`s.
     pub fn subscribe(&self) -> broadcast::Receiver<TransferEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Requests a clean pause for an active outgoing or incoming transfer, leaving
+    /// `.beamdrop.part` and `.resume.json` intact so resuming continues seamlessly.
+    pub async fn pause_transfer(&self, transfer_id: Uuid) -> bool {
+        let tx = {
+            let guard = self.active_controls.read().await;
+            guard.get(&transfer_id).cloned()
+        };
+        if let Some(tx) = tx {
+            tx.send_if_modified(|curr| {
+                if curr.is_none() {
+                    *curr = Some(ControlSignal {
+                        action: ControlAction::Pause,
+                        reason: Some("Paused by user".to_string()),
+                    });
+                    true
+                } else {
+                    false
+                }
+            });
+            return true;
+        }
+        false
+    }
+
+    /// Cancels an active or paused transfer, halting streams and deleting incomplete
+    /// `.beamdrop.part` and `.resume.json` files on the receiver.
+    pub async fn cancel_transfer(&self, transfer_id: Uuid) -> bool {
+        let tx = {
+            let guard = self.active_controls.read().await;
+            guard.get(&transfer_id).cloned()
+        };
+        if let Some(tx) = tx {
+            tx.send_if_modified(|curr| {
+                let replace = !matches!(
+                    curr.as_ref().map(|s| s.action),
+                    Some(ControlAction::Cancel)
+                );
+                if replace {
+                    *curr = Some(ControlSignal {
+                        action: ControlAction::Cancel,
+                        reason: Some("Cancelled by user".to_string()),
+                    });
+                }
+                replace
+            });
+            return true;
+        }
+
+        if let Some(paused) = self.paused_incoming.write().await.remove(&transfer_id) {
+            remove_partial_files(&paused.partial_files).await;
+            let _ = self.event_tx.send(TransferEvent::Cancelled {
+                transfer_id,
+                reason: Some("Cancelled by user".to_string()),
+            });
+            return true;
+        }
+
+        false
+    }
+
+    /// Returns the original sender's `NodeId` for a paused incoming transfer, if known.
+    pub async fn paused_incoming_sender(&self, transfer_id: Uuid) -> Option<NodeId> {
+        self.paused_incoming
+            .read()
+            .await
+            .get(&transfer_id)
+            .map(|info| info.sender_node_id)
+    }
+
+    /// Emits a `TransferEvent::Cancelled` notification for a transfer managed at the node level.
+    pub fn emit_cancelled(&self, transfer_id: Uuid, reason: Option<String>) {
+        let _ = self
+            .event_tx
+            .send(TransferEvent::Cancelled { transfer_id, reason });
+    }
+
+    /// Handles an out-of-band `Pause` or `Cancel` control message received after a transfer paused.
+    pub async fn handle_remote_control(&self, msg: Message) -> bool {
+        match msg {
+            Message::Cancel(ctrl) => {
+                if let Some(paused) = self.paused_incoming.write().await.remove(&ctrl.transfer_id) {
+                    remove_partial_files(&paused.partial_files).await;
+                    let _ = self.event_tx.send(TransferEvent::Cancelled {
+                        transfer_id: ctrl.transfer_id,
+                        reason: ctrl.reason.or_else(|| Some("Cancelled by peer".to_string())),
+                    });
+                    return true;
+                }
+                if let Some(tx) = self.active_controls.read().await.get(&ctrl.transfer_id).cloned() {
+                    let _ = tx.send(Some(ControlSignal {
+                        action: ControlAction::Cancel,
+                        reason: ctrl.reason.or_else(|| Some("Cancelled by peer".to_string())),
+                    }));
+                    return true;
+                }
+                false
+            }
+            Message::Pause(ctrl) => {
+                if let Some(tx) = self.active_controls.read().await.get(&ctrl.transfer_id).cloned() {
+                    let _ = tx.send(Some(ControlSignal {
+                        action: ControlAction::Pause,
+                        reason: ctrl.reason.or_else(|| Some("Paused by peer".to_string())),
+                    }));
+                    return true;
+                }
+                false
+            }
+            _ => false,
+        }
     }
 
     /// Spawns a single `accept_uni` reader loop for an incoming QUIC `Connection`.
@@ -577,7 +986,9 @@ impl TransferEngine {
                 .collect();
             for id in to_cancel {
                 if let Some(entry) = active.remove(&id) {
-                    let _ = entry.cancel_tx.send(true);
+                    if *entry.stop_tx.borrow() == WriterStop::Running {
+                        let _ = entry.stop_tx.send(WriterStop::Pause);
+                    }
                 }
             }
         });
@@ -587,11 +998,13 @@ impl TransferEngine {
         let mut header_buf = [0u8; UNI_CHUNK_HEADER_LEN];
         let mut cached_tid: Option<u64> = None;
         let mut cached_tx: Option<mpsc::Sender<IncomingChunk>> = None;
-        let mut cached_cancel: Option<watch::Receiver<bool>> = None;
+        let mut cached_stop_tx: Option<watch::Sender<WriterStop>> = None;
+        let mut cached_stop: Option<watch::Receiver<WriterStop>> = None;
+        let mut cached_cipher: Option<Arc<WanCipherContext>> = None;
 
         loop {
-            if let Some(ref cancel_rx) = cached_cancel {
-                if *cancel_rx.borrow() {
+            if let Some(ref stop_rx) = cached_stop {
+                if *stop_rx.borrow() != WriterStop::Running {
                     break;
                 }
             }
@@ -606,7 +1019,7 @@ impl TransferEngine {
             }
 
             let hdr = ChunkHeader::decode(&header_buf);
-            if hdr.chunk_len == 0 || hdr.chunk_len as usize > CHUNK_SIZE {
+            if hdr.chunk_len == 0 || hdr.chunk_len as usize > CHUNK_SIZE + WAN_CHUNK_OVERHEAD {
                 break;
             }
 
@@ -615,16 +1028,49 @@ impl TransferEngine {
                 if let Some(sink) = active.get(&hdr.transfer_id) {
                     cached_tid = Some(hdr.transfer_id);
                     cached_tx = Some(sink.chunk_tx.clone());
-                    cached_cancel = Some(sink.cancel_tx.subscribe());
+                    cached_stop_tx = Some(sink.stop_tx.clone());
+                    cached_stop = Some(sink.stop_tx.subscribe());
+                    cached_cipher = sink.wan_cipher.clone();
                 } else {
                     break;
                 }
             }
 
-            let mut data = vec![0u8; hdr.chunk_len as usize];
-            if recv.read_exact(&mut data).await.is_err() {
+            let max_wire = if cached_cipher.is_some() {
+                CHUNK_SIZE + WAN_CHUNK_OVERHEAD
+            } else {
+                CHUNK_SIZE
+            };
+            let min_wire = if cached_cipher.is_some() {
+                WAN_CHUNK_OVERHEAD + 1
+            } else {
+                1
+            };
+            if (hdr.chunk_len as usize) < min_wire || (hdr.chunk_len as usize) > max_wire {
+                if let Some(ref stop_tx) = cached_stop_tx {
+                    let _ = stop_tx.send(WriterStop::Cancel);
+                }
                 break;
             }
+
+            let mut wire_data = vec![0u8; hdr.chunk_len as usize];
+            if recv.read_exact(&mut wire_data).await.is_err() {
+                break;
+            }
+
+            let data = if let Some(ref cipher) = cached_cipher {
+                match cipher.decrypt_chunk(hdr.file_index, hdr.byte_offset, &wire_data) {
+                    Ok(plaintext) => plaintext,
+                    Err(_) => {
+                        if let Some(ref stop_tx) = cached_stop_tx {
+                            let _ = stop_tx.send(WriterStop::Cancel);
+                        }
+                        break;
+                    }
+                }
+            } else {
+                wire_data
+            };
 
             if let Some(ref tx) = cached_tx {
                 let chunk = IncomingChunk {
@@ -649,10 +1095,10 @@ impl TransferEngine {
     ) {
         let transfer_uuid = offer.transfer_id;
         let stream_tid = transfer_stream_id(transfer_uuid);
-
         let sender_node_id = match conn.remote_node_id() {
             Ok(id) => id,
             Err(err) => {
+                self.paused_incoming.write().await.remove(&transfer_uuid);
                 let reason = format!("Unauthenticated QUIC peer: {err}");
                 let reject = Message::Reject(RejectPayload {
                     transfer_id: transfer_uuid,
@@ -668,6 +1114,63 @@ impl TransferEngine {
             }
         };
 
+        let is_lan = self.is_connection_lan(sender_node_id);
+        let wan_cipher = if !is_lan || offer.wan_encrypted {
+            let maybe_secret = match &self.trust_store {
+                Some(store) => store.wan_secret_if_allowed(&sender_node_id).await,
+                None => None,
+            };
+            let Some(secret) = maybe_secret else {
+                self.paused_incoming.write().await.remove(&transfer_uuid);
+                let reason =
+                    "Long-distance WAN transfers are disabled for this contact".to_string();
+                let reject = Message::Reject(RejectPayload {
+                    transfer_id: transfer_uuid,
+                    reason: Some(reason.clone()),
+                });
+                let _ = write_frame(&mut ctrl_send, &reject).await;
+                let _ = ctrl_send.finish();
+                let _ = self.event_tx.send(TransferEvent::Interrupted {
+                    transfer_id: transfer_uuid,
+                    reason,
+                });
+                return;
+            };
+            if !is_lan && !offer.wan_encrypted {
+                self.paused_incoming.write().await.remove(&transfer_uuid);
+                let reason =
+                    "Encrypted WAN payload framing is required over non-LAN connections".to_string();
+                let reject = Message::Reject(RejectPayload {
+                    transfer_id: transfer_uuid,
+                    reason: Some(reason.clone()),
+                });
+                let _ = write_frame(&mut ctrl_send, &reject).await;
+                let _ = ctrl_send.finish();
+                let _ = self.event_tx.send(TransferEvent::Interrupted {
+                    transfer_id: transfer_uuid,
+                    reason,
+                });
+                return;
+            }
+            Some(Arc::new(WanCipherContext::new(transfer_uuid, secret)))
+        } else {
+            None
+        };
+
+        let was_previously_approved_pause = self
+            .paused_incoming
+            .write()
+            .await
+            .remove(&transfer_uuid)
+            .is_some_and(|info| info.sender_node_id == sender_node_id);
+
+        let (ctrl_tx, mut ctrl_rx) = watch::channel::<Option<ControlSignal>>(None);
+        {
+            let mut controls = self.active_controls.write().await;
+            controls.insert(transfer_uuid, ctrl_tx);
+        }
+        let mut ctrl_guard = ControlMapGuard::new(transfer_uuid, Arc::clone(&self.active_controls));
+
         let _ = self.event_tx.send(TransferEvent::OfferReceived {
             transfer_id: transfer_uuid,
             sender_name: offer.sender_name.clone(),
@@ -675,10 +1178,11 @@ impl TransferEngine {
             total_bytes: offer.total_bytes,
         });
 
-        let auto_accept = match &self.trust_store {
-            Some(store) => store.is_auto_accept_trusted(&sender_node_id).await,
-            None => false,
-        };
+        let auto_accept = was_previously_approved_pause
+            || match &self.trust_store {
+                Some(store) => store.is_auto_accept_trusted(&sender_node_id).await,
+                None => false,
+            };
 
         if auto_accept {
             let _ = self.event_tx.send(TransferEvent::AutoAccepted {
@@ -703,21 +1207,62 @@ impl TransferEngine {
                 total_bytes: offer.total_bytes,
             });
 
+            enum ApprovalOutcome {
+                Approved,
+                Rejected(String),
+                Control {
+                    signal: ControlSignal,
+                    initiated_locally: bool,
+                },
+            }
+
             let wait_dur = *self.approval_timeout.read().await;
-            let decision = tokio::select! {
+            let outcome = tokio::select! {
+                biased;
+                _ = ctrl_rx.changed(), if ctrl_rx.borrow().is_some() => {
+                    ApprovalOutcome::Control {
+                        signal: ctrl_rx.borrow().clone().expect("checked is_some"),
+                        initiated_locally: true,
+                    }
+                }
+                remote = read_frame(&mut ctrl_recv) => {
+                    match remote {
+                        Ok(Message::Pause(p)) => ApprovalOutcome::Control {
+                            signal: ControlSignal {
+                                action: ControlAction::Pause,
+                                reason: p.reason.or_else(|| Some("Paused by peer".to_string())),
+                            },
+                            initiated_locally: false,
+                        },
+                        Ok(Message::Cancel(c)) => ApprovalOutcome::Control {
+                            signal: ControlSignal {
+                                action: ControlAction::Cancel,
+                                reason: c.reason.or_else(|| Some("Cancelled by peer".to_string())),
+                            },
+                            initiated_locally: false,
+                        },
+                        Ok(other) => ApprovalOutcome::Rejected(format!(
+                            "Unexpected control frame before acceptance: {:?}",
+                            other.message_type()
+                        )),
+                        Err(_) => ApprovalOutcome::Rejected(
+                            "Sender disconnected before transfer approval".to_string(),
+                        ),
+                    }
+                }
                 res = tokio::time::timeout(wait_dur, rx) => {
                     match res {
-                        Ok(Ok(true)) => Ok(()),
-                        Ok(Ok(false)) => Err("Transfer rejected by user".to_string()),
-                        Ok(Err(_)) => Err("Transfer approval channel closed".to_string()),
-                        Err(_) => Err(format!(
+                        Ok(Ok(true)) => ApprovalOutcome::Approved,
+                        Ok(Ok(false)) => ApprovalOutcome::Rejected("Transfer rejected by user".to_string()),
+                        Ok(Err(_)) => ApprovalOutcome::Rejected("Transfer approval channel closed".to_string()),
+                        Err(_) => ApprovalOutcome::Rejected(format!(
                             "Untrusted transfer offer timed out after {}s",
                             wait_dur.as_secs()
                         )),
                     }
                 }
                 _ = conn.closed() => {
-                    Err("Sender disconnected before transfer approval".to_string())
+                    ApprovalOutcome::Rejected("Sender disconnected before transfer approval".to_string())
                 }
             };
 
@@ -726,25 +1271,41 @@ impl TransferEngine {
                 pending.remove(&transfer_uuid);
             }
 
-            if let Err(reason) = decision {
-                let reject = Message::Reject(RejectPayload {
-                    transfer_id: transfer_uuid,
-                    reason: Some(reason.clone()),
-                });
-                let _ = write_frame(&mut ctrl_send, &reject).await;
-                let _ = ctrl_send.finish();
-                let _ = self.event_tx.send(TransferEvent::Interrupted {
-                    transfer_id: transfer_uuid,
-                    reason,
-                });
-                return;
+            match outcome {
+                ApprovalOutcome::Approved => {}
+                ApprovalOutcome::Control {
+                    signal,
+                    initiated_locally,
+                } => {
+                    ctrl_guard.remove_now().await;
+                    if initiated_locally {
+                        send_control_frame(&mut ctrl_send, transfer_uuid, &signal).await;
+                    }
+                    emit_control_event(&self.event_tx, transfer_uuid, signal);
+                    return;
+                }
+                ApprovalOutcome::Rejected(reason) => {
+                    ctrl_guard.remove_now().await;
+                    let reject = Message::Reject(RejectPayload {
+                        transfer_id: transfer_uuid,
+                        reason: Some(reason.clone()),
+                    });
+                    let _ = write_frame(&mut ctrl_send, &reject).await;
+                    let _ = ctrl_send.finish();
+                    let _ = self.event_tx.send(TransferEvent::Interrupted {
+                        transfer_id: transfer_uuid,
+                        reason,
+                    });
+                    return;
+                }
             }
         }
 
         let prepared = match self.prepare_incoming_files(&offer.files).await {
             Ok(files) => files,
             Err(err) => {
-                let reject = Message::Reject(crate::protocol::RejectPayload {
+                ctrl_guard.remove_now().await;
+                let reject = Message::Reject(RejectPayload {
                     transfer_id: transfer_uuid,
                     reason: Some(err.to_string()),
                 });
@@ -758,10 +1319,22 @@ impl TransferEngine {
             }
         };
 
+        let partial_files: Vec<PartialFilePaths> = prepared
+            .iter()
+            .map(|f| PartialFilePaths {
+                part_path: f.part_path.clone(),
+                resume_path: f.resume_path.clone(),
+            })
+            .collect();
+
         let mut accepted_file_ids = Vec::with_capacity(prepared.len());
         let mut file_resumes = Vec::with_capacity(prepared.len());
         let mut remaining_chunks = 0u64;
         let mut initial_skipped_bytes = 0u64;
+        let first_file_name = prepared
+            .first()
+            .map(|f| f.relative_path.clone())
+            .unwrap_or_default();
 
         for state in &prepared {
             accepted_file_ids.push(state.file_id);
@@ -775,7 +1348,7 @@ impl TransferEngine {
         }
 
         let (chunk_tx, chunk_rx) = mpsc::channel::<IncomingChunk>(CHANNEL_BOUND);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (stop_tx, stop_rx) = watch::channel(WriterStop::Running);
 
         {
             let mut active = self.active_incoming.write().await;
@@ -784,19 +1357,20 @@ impl TransferEngine {
                 ActiveIncomingTransfer {
                     conn_stable_id: conn.stable_id(),
                     chunk_tx: chunk_tx.clone(),
-                    cancel_tx: cancel_tx.clone(),
+                    stop_tx: stop_tx.clone(),
+                    wan_cipher,
                 },
             );
         }
 
-        let writer_handle = tokio::spawn(run_incoming_writer(
+        let mut writer_handle = tokio::spawn(run_incoming_writer(
             transfer_uuid,
             prepared,
             remaining_chunks,
             offer.total_bytes,
             initial_skipped_bytes,
             chunk_rx,
-            cancel_rx,
+            stop_rx,
             self.event_tx.clone(),
         ));
 
@@ -807,7 +1381,9 @@ impl TransferEngine {
         });
 
         if let Err(err) = write_frame(&mut ctrl_send, &accept_msg).await {
-            self.cleanup_active_transfer(stream_tid, &cancel_tx).await;
+            ctrl_guard.remove_now().await;
+            self.cleanup_active_transfer(stream_tid, &stop_tx, WriterStop::Pause)
+                .await;
             drop(chunk_tx);
             let _ = writer_handle.await;
             let _ = self.event_tx.send(TransferEvent::Interrupted {
@@ -817,32 +1393,107 @@ impl TransferEngine {
             return;
         }
 
-        // Wait for sender's `Message::Complete` frame on the bidirectional control stream.
-        let complete_msg = tokio::select! {
-            res = read_frame(&mut ctrl_recv) => res,
+        if initial_skipped_bytes > 0 {
+            let _ = self.event_tx.send(TransferEvent::Progress(TransferProgress {
+                transfer_id: transfer_uuid,
+                file_name: first_file_name,
+                bytes_transferred: 0,
+                bytes_skipped_resumed: initial_skipped_bytes,
+                total_bytes: offer.total_bytes,
+                streams_active: if offer.total_bytes > PARALLEL_STRIPE_THRESHOLD {
+                    MAX_PARALLEL_STREAMS
+                } else {
+                    1
+                },
+            }));
+        }
+
+        enum IncomingWaitResult {
+            Complete(CompletePayload),
+            Control {
+                signal: ControlSignal,
+                initiated_locally: bool,
+            },
+            Unexpected(String),
+            Disconnected(String),
+        }
+
+        let wait_result = tokio::select! {
+            biased;
+            _ = ctrl_rx.changed(), if ctrl_rx.borrow().is_some() => {
+                IncomingWaitResult::Control {
+                    signal: ctrl_rx.borrow().clone().expect("checked is_some"),
+                    initiated_locally: true,
+                }
+            }
+            res = read_frame(&mut ctrl_recv) => {
+                match res {
+                    Ok(Message::Complete(c)) if c.transfer_id == transfer_uuid => {
+                        IncomingWaitResult::Complete(c)
+                    }
+                    Ok(Message::Pause(p)) => IncomingWaitResult::Control {
+                        signal: ControlSignal {
+                            action: ControlAction::Pause,
+                            reason: p.reason.or_else(|| Some("Paused by sender".to_string())),
+                        },
+                        initiated_locally: false,
+                    },
+                    Ok(Message::Cancel(c)) => IncomingWaitResult::Control {
+                        signal: ControlSignal {
+                            action: ControlAction::Cancel,
+                            reason: c.reason.or_else(|| Some("Cancelled by sender".to_string())),
+                        },
+                        initiated_locally: false,
+                    },
+                    Ok(other) => IncomingWaitResult::Unexpected(format!(
+                        "Unexpected control frame: {:?}",
+                        other.message_type()
+                    )),
+                    Err(err) => IncomingWaitResult::Disconnected(err.to_string()),
+                }
+            }
             _ = conn.closed() => {
-                Err(ProtocolError::Io(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionReset,
-                    "Connection closed before transfer completion",
-                )))
+                IncomingWaitResult::Disconnected("Connection closed before transfer completion".to_string())
             }
         };
 
-        let sender_complete = match complete_msg {
-            Ok(Message::Complete(c)) if c.transfer_id == transfer_uuid => c,
-            Ok(other) => {
-                self.cleanup_active_transfer(stream_tid, &cancel_tx).await;
+        let sender_complete = match wait_result {
+            IncomingWaitResult::Complete(c) => c,
+            IncomingWaitResult::Control {
+                signal,
+                initiated_locally,
+            } => {
+                self.finish_incoming_control_stop(
+                    transfer_uuid,
+                    sender_node_id,
+                    stream_tid,
+                    &mut ctrl_send,
+                    &mut ctrl_guard,
+                    &ctrl_rx,
+                    &stop_tx,
+                    chunk_tx,
+                    &mut writer_handle,
+                    partial_files,
+                    signal,
+                    initiated_locally,
+                )
+                .await;
+                return;
+            }
+            IncomingWaitResult::Unexpected(reason) => {
+                ctrl_guard.remove_now().await;
+                self.cleanup_active_transfer(stream_tid, &stop_tx, WriterStop::Pause)
+                    .await;
                 drop(chunk_tx);
                 let _ = writer_handle.await;
                 let _ = self.event_tx.send(TransferEvent::Interrupted {
                     transfer_id: transfer_uuid,
-                    reason: format!("Unexpected control frame: {:?}", other.message_type()),
+                    reason,
                 });
                 return;
             }
-            Err(err) => {
-                // Connection interrupted mid-transfer: allow already-received chunks in chunk_rx
-                // to flush into `.beamdrop.part` and save `.resume.json`.
+            IncomingWaitResult::Disconnected(reason) => {
+                ctrl_guard.remove_now().await;
                 {
                     let mut active = self.active_incoming.write().await;
                     active.remove(&stream_tid);
@@ -851,30 +1502,104 @@ impl TransferEngine {
                 let _ = tokio::time::timeout(Duration::from_secs(2), writer_handle).await;
                 let _ = self.event_tx.send(TransferEvent::Interrupted {
                     transfer_id: transfer_uuid,
-                    reason: err.to_string(),
+                    reason,
                 });
                 return;
             }
         };
 
-        // Wait for the writer task to finish writing and hashing all chunks.
-        let writer_res = tokio::select! {
-            res = writer_handle => {
-                match res {
-                    Ok(inner) => inner,
-                    Err(e) => Err(TransferError::Quic(e.to_string())),
+        // Wait for the writer task to finish writing and hashing all chunks, still allowing late
+        // pause/cancel from either the local receiver or the sender's control stream.
+        tokio::pin!(writer_handle);
+        let mut remote_closed = false;
+        let writer_res = loop {
+            tokio::select! {
+                biased;
+                _ = ctrl_rx.changed(), if ctrl_rx.borrow().is_some() => {
+                    let signal = ctrl_rx.borrow().clone().expect("checked is_some");
+                    self.finish_incoming_control_stop(
+                        transfer_uuid,
+                        sender_node_id,
+                        stream_tid,
+                        &mut ctrl_send,
+                        &mut ctrl_guard,
+                        &ctrl_rx,
+                        &stop_tx,
+                        chunk_tx,
+                        &mut writer_handle,
+                        partial_files,
+                        signal,
+                        true,
+                    )
+                    .await;
+                    return;
                 }
-            }
-            _ = conn.closed() => {
-                self.cleanup_active_transfer(stream_tid, &cancel_tx).await;
-                Err(TransferError::DisconnectedMidTransfer {
-                    transfer_id: transfer_uuid,
-                    remaining_chunks: 1,
-                })
+                remote = read_frame(&mut ctrl_recv), if !remote_closed => {
+                    let remote_signal = match remote {
+                        Ok(Message::Pause(p)) => Some(ControlSignal {
+                            action: ControlAction::Pause,
+                            reason: p.reason.or_else(|| Some("Paused by sender".to_string())),
+                        }),
+                        Ok(Message::Cancel(c)) => Some(ControlSignal {
+                            action: ControlAction::Cancel,
+                            reason: c.reason.or_else(|| Some("Cancelled by sender".to_string())),
+                        }),
+                        Ok(other) => {
+                            self.cleanup_active_transfer(stream_tid, &stop_tx, WriterStop::Pause)
+                                .await;
+                            break Err(TransferError::UnexpectedMessage(format!(
+                                "Unexpected control frame: {:?}",
+                                other.message_type()
+                            )));
+                        }
+                        Err(ProtocolError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            remote_closed = true;
+                            None
+                        }
+                        Err(err) => {
+                            self.cleanup_active_transfer(stream_tid, &stop_tx, WriterStop::Pause)
+                                .await;
+                            break Err(TransferError::Protocol(err));
+                        }
+                    };
+                    if let Some(signal) = remote_signal {
+                        self.finish_incoming_control_stop(
+                            transfer_uuid,
+                            sender_node_id,
+                            stream_tid,
+                            &mut ctrl_send,
+                            &mut ctrl_guard,
+                            &ctrl_rx,
+                            &stop_tx,
+                            chunk_tx,
+                            &mut writer_handle,
+                            partial_files,
+                            signal,
+                            false,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                res = &mut writer_handle => {
+                    break match res {
+                        Ok(inner) => inner,
+                        Err(e) => Err(TransferError::Quic(e.to_string())),
+                    };
+                }
+                _ = conn.closed() => {
+                    self.cleanup_active_transfer(stream_tid, &stop_tx, WriterStop::Pause)
+                        .await;
+                    break Err(TransferError::DisconnectedMidTransfer {
+                        transfer_id: transfer_uuid,
+                        remaining_chunks: 1,
+                    });
+                }
             }
         };
 
-        // Always remove active sink entry now that writer finished.
+        // Always remove active sink and control entries now that writer finished.
+        ctrl_guard.remove_now().await;
         {
             let mut active = self.active_incoming.write().await;
             active.remove(&stream_tid);
@@ -953,6 +1678,34 @@ impl TransferEngine {
                     output_dir: Some(self.download_dir.clone()),
                 });
             }
+            Err(TransferError::Paused(_)) => {
+                self.paused_incoming.write().await.insert(
+                    transfer_uuid,
+                    PausedIncomingInfo {
+                        sender_node_id,
+                        partial_files,
+                    },
+                );
+                emit_control_event(
+                    &self.event_tx,
+                    transfer_uuid,
+                    ControlSignal {
+                        action: ControlAction::Pause,
+                        reason: Some("Paused".to_string()),
+                    },
+                );
+            }
+            Err(TransferError::Cancelled(_)) => {
+                remove_partial_files(&partial_files).await;
+                emit_control_event(
+                    &self.event_tx,
+                    transfer_uuid,
+                    ControlSignal {
+                        action: ControlAction::Cancel,
+                        reason: Some("Cancelled".to_string()),
+                    },
+                );
+            }
             Err(err) => {
                 let _ = self.event_tx.send(TransferEvent::Interrupted {
                     transfer_id: transfer_uuid,
@@ -962,8 +1715,80 @@ impl TransferEngine {
         }
     }
 
-    async fn cleanup_active_transfer(&self, stream_tid: u64, cancel_tx: &watch::Sender<bool>) {
-        let _ = cancel_tx.send(true);
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_incoming_control_stop(
+        &self,
+        transfer_uuid: Uuid,
+        sender_node_id: NodeId,
+        stream_tid: u64,
+        ctrl_send: &mut SendStream,
+        ctrl_guard: &mut ControlMapGuard,
+        ctrl_rx: &watch::Receiver<Option<ControlSignal>>,
+        stop_tx: &watch::Sender<WriterStop>,
+        chunk_tx: mpsc::Sender<IncomingChunk>,
+        writer_handle: &mut JoinHandle<Result<Vec<CompletedFileInfo>, TransferError>>,
+        partial_files: Vec<PartialFilePaths>,
+        signal: ControlSignal,
+        initiated_locally: bool,
+    ) {
+        let stop_mode = match signal.action {
+            ControlAction::Pause => WriterStop::Pause,
+            ControlAction::Cancel => WriterStop::Cancel,
+        };
+        if initiated_locally {
+            send_control_frame(ctrl_send, transfer_uuid, &signal).await;
+        }
+        self.cleanup_active_transfer(stream_tid, stop_tx, stop_mode)
+            .await;
+        drop(chunk_tx);
+
+        // Wait briefly for writer_handle to flush/save (Pause) or drop File handles (Cancel).
+        if tokio::time::timeout(Duration::from_secs(2), &mut *writer_handle)
+            .await
+            .is_err()
+        {
+            writer_handle.abort();
+            let _ = writer_handle.await;
+        }
+
+        // Atomically transition from `active_controls` into `paused_incoming` (lock order:
+        // `paused_incoming` -> `active_controls`) so an out-of-band `Cancel` cannot miss either map.
+        let mut paused_guard = self.paused_incoming.write().await;
+        ctrl_guard.remove_now().await;
+        let final_signal = ctrl_rx.borrow().clone().unwrap_or(signal);
+
+        match final_signal.action {
+            ControlAction::Pause => {
+                paused_guard.insert(
+                    transfer_uuid,
+                    PausedIncomingInfo {
+                        sender_node_id,
+                        partial_files,
+                    },
+                );
+                drop(paused_guard);
+            }
+            ControlAction::Cancel => {
+                paused_guard.remove(&transfer_uuid);
+                drop(paused_guard);
+                remove_partial_files(&partial_files).await;
+            }
+        }
+
+        emit_control_event(&self.event_tx, transfer_uuid, final_signal);
+        if !initiated_locally {
+            // Confirm receipt + state persistence so sender does not close `Connection` prematurely.
+            let _ = ctrl_send.finish();
+        }
+    }
+
+    async fn cleanup_active_transfer(
+        &self,
+        stream_tid: u64,
+        stop_tx: &watch::Sender<WriterStop>,
+        mode: WriterStop,
+    ) {
+        let _ = stop_tx.send(mode);
         let mut active = self.active_incoming.write().await;
         active.remove(&stream_tid);
     }
@@ -1053,17 +1878,107 @@ impl TransferEngine {
         source_path: &Path,
         progress_tx: Option<mpsc::Sender<TransferProgress>>,
     ) -> Result<TransferSummary, TransferError> {
+        self.send_path_with_id(conn, sender_name, source_path, None, None, progress_tx)
+            .await
+    }
+
+    /// Sends a single file or recursive directory with optional target metadata and explicit
+    /// `transfer_id` (used when resuming paused outgoing transfers in-place).
+    pub async fn send_path_with_id(
+        &self,
+        conn: &Connection,
+        sender_name: &str,
+        source_path: &Path,
+        peer_name: Option<&str>,
+        transfer_id_override: Option<Uuid>,
+        progress_tx: Option<mpsc::Sender<TransferProgress>>,
+    ) -> Result<TransferSummary, TransferError> {
+        self.send_path_with_wan_override(
+            conn,
+            sender_name,
+            source_path,
+            peer_name,
+            transfer_id_override,
+            progress_tx,
+            None,
+        )
+        .await
+    }
+
+    /// Sends a single file or recursive directory with explicit control over whether daily-rotating
+    /// ChaCha20-Poly1305 WAN encryption is enforced (`None` = automatic based on LAN vs WAN path).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_path_with_wan_override(
+        &self,
+        conn: &Connection,
+        sender_name: &str,
+        source_path: &Path,
+        peer_name: Option<&str>,
+        transfer_id_override: Option<Uuid>,
+        progress_tx: Option<mpsc::Sender<TransferProgress>>,
+        force_wan_encryption: Option<bool>,
+    ) -> Result<TransferSummary, TransferError> {
         let start = Instant::now();
         let manifest = collect_transfer_manifest(source_path).await?;
-        let transfer_uuid = Uuid::new_v4();
+        let transfer_uuid = transfer_id_override.unwrap_or_else(Uuid::new_v4);
         let stream_tid = transfer_stream_id(transfer_uuid);
         let total_bytes: u64 = manifest.iter().map(|m| m.offer_entry.size_bytes).sum();
+        let peer_node_id = conn
+            .remote_node_id()
+            .map_err(|e| TransferError::Quic(e.to_string()))?;
+
+        let encrypt_wan = force_wan_encryption.unwrap_or_else(|| !self.is_connection_lan(peer_node_id));
+        let wan_cipher = if encrypt_wan {
+            let secret = match &self.trust_store {
+                Some(store) => store.wan_secret_if_allowed(&peer_node_id).await,
+                None => None,
+            };
+            let Some(secret) = secret else {
+                return Err(TransferError::WanDisallowed(
+                    "Long-distance transfers are disabled for this contact".to_string(),
+                ));
+            };
+            Some(Arc::new(WanCipherContext::new(transfer_uuid, secret)))
+        } else {
+            None
+        };
+
+        let primary_name = source_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                manifest
+                    .first()
+                    .map(|m| m.offer_entry.relative_path.clone())
+                    .unwrap_or_default()
+            });
+
+        let (ctrl_tx, mut ctrl_rx) = watch::channel::<Option<ControlSignal>>(None);
+        {
+            let mut controls = self.active_controls.write().await;
+            controls.insert(transfer_uuid, ctrl_tx);
+        }
+        let mut ctrl_guard = ControlMapGuard::new(transfer_uuid, Arc::clone(&self.active_controls));
+
+        let _ = self.event_tx.send(TransferEvent::Started {
+            transfer_id: transfer_uuid,
+            peer_node_id,
+            peer_name: peer_name
+                .map(ToString::to_string)
+                .unwrap_or_else(|| peer_node_id.to_string()),
+            file_name: primary_name,
+            files: manifest.len(),
+            total_bytes,
+            bytes_skipped_resumed: 0,
+        });
 
         let offer = OfferPayload {
             transfer_id: transfer_uuid,
             sender_name: sender_name.to_string(),
             files: manifest.iter().map(|m| m.offer_entry.clone()).collect(),
             total_bytes,
+            wan_encrypted: wan_cipher.is_some(),
         };
 
         let (mut ctrl_send, mut ctrl_recv) = conn
@@ -1073,19 +1988,51 @@ impl TransferEngine {
 
         write_frame(&mut ctrl_send, &Message::Offer(offer)).await?;
 
-        let accept = match read_frame(&mut ctrl_recv).await? {
-            Message::Accept(a) => a,
-            Message::Reject(r) => {
-                return Err(TransferError::Rejected(
-                    transfer_uuid,
-                    r.reason.unwrap_or_else(|| "No reason given".to_string()),
-                ));
+        let accept = tokio::select! {
+            biased;
+            _ = ctrl_rx.changed(), if ctrl_rx.borrow().is_some() => {
+                let signal = ctrl_rx.borrow().clone().expect("checked is_some");
+                ctrl_guard.remove_now().await;
+                send_control_frame(&mut ctrl_send, transfer_uuid, &signal).await;
+                emit_control_event(&self.event_tx, transfer_uuid, signal.clone());
+                return Err(control_error(transfer_uuid, signal.action));
             }
-            other => {
-                return Err(TransferError::UnexpectedMessage(format!(
-                    "{:?}",
-                    other.message_type()
-                )));
+            frame_res = read_frame(&mut ctrl_recv) => {
+                match frame_res? {
+                    Message::Accept(a) => a,
+                    Message::Reject(r) => {
+                        ctrl_guard.remove_now().await;
+                        return Err(TransferError::Rejected(
+                            transfer_uuid,
+                            r.reason.unwrap_or_else(|| "No reason given".to_string()),
+                        ));
+                    }
+                    Message::Pause(p) => {
+                        ctrl_guard.remove_now().await;
+                        let signal = ControlSignal {
+                            action: ControlAction::Pause,
+                            reason: p.reason.or_else(|| Some("Paused by receiver".to_string())),
+                        };
+                        emit_control_event(&self.event_tx, transfer_uuid, signal);
+                        return Err(TransferError::Paused(transfer_uuid));
+                    }
+                    Message::Cancel(c) => {
+                        ctrl_guard.remove_now().await;
+                        let signal = ControlSignal {
+                            action: ControlAction::Cancel,
+                            reason: c.reason.or_else(|| Some("Cancelled by receiver".to_string())),
+                        };
+                        emit_control_event(&self.event_tx, transfer_uuid, signal);
+                        return Err(TransferError::Cancelled(transfer_uuid));
+                    }
+                    other => {
+                        ctrl_guard.remove_now().await;
+                        return Err(TransferError::UnexpectedMessage(format!(
+                            "{:?}",
+                            other.message_type()
+                        )));
+                    }
+                }
             }
         };
 
@@ -1134,23 +2081,35 @@ impl TransferEngine {
             1
         };
 
+        let first_file_label = manifest
+            .first()
+            .map(|m| m.offer_entry.relative_path.clone())
+            .unwrap_or_default();
+
+        if bytes_skipped_resumed > 0 {
+            let _ = self.event_tx.send(TransferEvent::Progress(TransferProgress {
+                transfer_id: transfer_uuid,
+                file_name: first_file_label.clone(),
+                bytes_transferred: 0,
+                bytes_skipped_resumed,
+                total_bytes,
+                streams_active: num_streams,
+            }));
+        }
+
         let (chunk_tx, chunk_rx) = mpsc::channel::<OutgoingChunk>(CHANNEL_BOUND);
         let shared_rx = Arc::new(Mutex::new(chunk_rx));
         let bytes_sent_counter = Arc::new(AtomicU64::new(0));
-        let current_file_label = Arc::new(RwLock::new(
-            manifest
-                .first()
-                .map(|m| m.offer_entry.relative_path.clone())
-                .unwrap_or_default(),
-        ));
+        let current_file_label = Arc::new(RwLock::new(first_file_label));
 
         // Spawn progress ticker so UI updates smoothly without blocking the QUIC hot path
         let progress_stop = Arc::new(watch::channel(false).0);
-        let progress_task = progress_tx.map(|tx| {
+        let progress_task = {
             let sent = Arc::clone(&bytes_sent_counter);
             let label = Arc::clone(&current_file_label);
             let mut stop_rx = progress_stop.subscribe();
             let event_tx = self.event_tx.clone();
+            let opt_tx = progress_tx;
             AbortOnDrop::new(tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_millis(50));
                 loop {
@@ -1166,14 +2125,16 @@ impl TransferEngine {
                                 total_bytes,
                                 streams_active: num_streams,
                             };
-                            let _ = tx.try_send(snap.clone());
+                            if let Some(ref tx) = opt_tx {
+                                let _ = tx.try_send(snap.clone());
+                            }
                             let _ = event_tx.send(TransferEvent::Progress(snap));
                         }
                         _ = stop_rx.changed() => break,
                     }
                 }
             }))
-        });
+        };
 
         // Spawn up to 6 concurrent unidirectional QUIC data streams (JoinSet auto-aborts on drop)
         let mut workers = JoinSet::new();
@@ -1181,6 +2142,7 @@ impl TransferEngine {
             let rx = Arc::clone(&shared_rx);
             let conn = conn.clone();
             let sent = Arc::clone(&bytes_sent_counter);
+            let worker_cipher = wan_cipher.clone();
             workers.spawn(async move {
                 let mut uni: Option<SendStream> = None;
                 loop {
@@ -1201,7 +2163,19 @@ impl TransferEngine {
                     }
 
                     let stream = uni.as_mut().expect("initialized uni stream");
-                    let chunk_len = chunk.data.len() as u32;
+                    let plaintext_len = chunk.data.len() as u64;
+                    let wire_data = match worker_cipher {
+                        Some(ref cipher) => {
+                            let encrypted = cipher.encrypt_chunk(
+                                chunk.file_index,
+                                chunk.byte_offset,
+                                &chunk.data,
+                            )?;
+                            Bytes::from(encrypted)
+                        }
+                        None => chunk.data,
+                    };
+                    let chunk_len = wire_data.len() as u32;
                     let header = ChunkHeader {
                         transfer_id: stream_tid,
                         file_index: chunk.file_index,
@@ -1210,16 +2184,16 @@ impl TransferEngine {
                     }
                     .encode();
 
-                    // Write 24-byte header immediately followed by raw file bytes
+                    // Write 24-byte header immediately followed by payload bytes
                     stream
                         .write_all_chunks(&mut [
                             Bytes::copy_from_slice(&header),
-                            chunk.data,
+                            wire_data,
                         ])
                         .await
                         .map_err(|e| TransferError::Quic(e.to_string()))?;
 
-                    sent.fetch_add(chunk_len as u64, Ordering::Relaxed);
+                    sent.fetch_add(plaintext_len, Ordering::Relaxed);
                 }
 
                 if let Some(mut stream) = uni {
@@ -1306,13 +2280,15 @@ impl TransferEngine {
             Ok::<Vec<FileHashEntry>, TransferError>(file_hashes)
         }));
 
-        let reader_fut = async {
-            match reader_handle.join().await {
-                Ok(res) => res,
-                Err(e) => Err(TransferError::Quic(e.to_string())),
-            }
-        };
-        let workers_fut = async move {
+        enum OutgoingStageOutcome {
+            Completed(Result<Vec<FileHashEntry>, TransferError>),
+            Control {
+                signal: ControlSignal,
+                initiated_locally: bool,
+            },
+        }
+
+        let workers_fut = async {
             while let Some(res) = workers.join_next().await {
                 match res {
                     Ok(inner) => inner?,
@@ -1321,13 +2297,120 @@ impl TransferEngine {
             }
             Ok::<(), TransferError>(())
         };
+        let mut reader_opt = Some(reader_handle);
+        let reader_fut = async {
+            let handle = reader_opt.take().expect("reader_handle present");
+            match handle.join().await {
+                Ok(res) => res,
+                Err(e) => Err(TransferError::Quic(e.to_string())),
+            }
+        };
 
-        let (file_hashes, ()) = tokio::try_join!(reader_fut, workers_fut)?;
+        let stage_outcome = tokio::select! {
+            biased;
+            _ = ctrl_rx.changed(), if ctrl_rx.borrow().is_some() => {
+                OutgoingStageOutcome::Control {
+                    signal: ctrl_rx.borrow().clone().expect("checked is_some"),
+                    initiated_locally: true,
+                }
+            }
+            res = async { tokio::try_join!(reader_fut, workers_fut).map(|(hashes, ())| hashes) } => {
+                OutgoingStageOutcome::Completed(res)
+            }
+            remote = read_frame(&mut ctrl_recv) => {
+                match remote {
+                    Ok(Message::Pause(p)) => OutgoingStageOutcome::Control {
+                        signal: ControlSignal {
+                            action: ControlAction::Pause,
+                            reason: p.reason.or_else(|| Some("Paused by receiver".to_string())),
+                        },
+                        initiated_locally: false,
+                    },
+                    Ok(Message::Cancel(c)) => OutgoingStageOutcome::Control {
+                        signal: ControlSignal {
+                            action: ControlAction::Cancel,
+                            reason: c.reason.or_else(|| Some("Cancelled by receiver".to_string())),
+                        },
+                        initiated_locally: false,
+                    },
+                    Ok(other) => OutgoingStageOutcome::Completed(Err(TransferError::UnexpectedMessage(
+                        format!("{:?}", other.message_type()),
+                    ))),
+                    Err(err) => OutgoingStageOutcome::Completed(Err(TransferError::Protocol(err))),
+                }
+            }
+        };
+
+        let file_hashes = match stage_outcome {
+            OutgoingStageOutcome::Completed(Ok(hashes)) => hashes,
+            OutgoingStageOutcome::Completed(Err(err)) => {
+                drop(reader_opt);
+                workers.shutdown().await;
+                let _ = progress_stop.send(true);
+                let _ = progress_task.join().await;
+
+                // Check if local control fired or receiver sent Pause/Cancel just ahead of QUIC reset.
+                let maybe_signal = ctrl_rx.borrow().clone();
+                if let Some(signal) = maybe_signal {
+                    ctrl_guard.remove_now().await;
+                    send_control_frame(&mut ctrl_send, transfer_uuid, &signal).await;
+                    emit_control_event(&self.event_tx, transfer_uuid, signal.clone());
+                    return Err(control_error(transfer_uuid, signal.action));
+                }
+                if let Ok(Ok(remote_msg)) =
+                    tokio::time::timeout(Duration::from_millis(150), read_frame(&mut ctrl_recv)).await
+                {
+                    match remote_msg {
+                        Message::Pause(p) => {
+                            ctrl_guard.remove_now().await;
+                            let _ = ctrl_send.finish();
+                            let signal = ControlSignal {
+                                action: ControlAction::Pause,
+                                reason: p.reason.or_else(|| Some("Paused by receiver".to_string())),
+                            };
+                            emit_control_event(&self.event_tx, transfer_uuid, signal);
+                            return Err(TransferError::Paused(transfer_uuid));
+                        }
+                        Message::Cancel(c) => {
+                            ctrl_guard.remove_now().await;
+                            let _ = ctrl_send.finish();
+                            let signal = ControlSignal {
+                                action: ControlAction::Cancel,
+                                reason: c.reason.or_else(|| Some("Cancelled by receiver".to_string())),
+                            };
+                            emit_control_event(&self.event_tx, transfer_uuid, signal);
+                            return Err(TransferError::Cancelled(transfer_uuid));
+                        }
+                        _ => {}
+                    }
+                }
+                ctrl_guard.remove_now().await;
+                return Err(err);
+            }
+            OutgoingStageOutcome::Control {
+                signal,
+                initiated_locally,
+            } => {
+                drop(reader_opt);
+                workers.shutdown().await;
+                let _ = progress_stop.send(true);
+                let _ = progress_task.join().await;
+                ctrl_guard.remove_now().await;
+                if initiated_locally {
+                    send_control_frame(&mut ctrl_send, transfer_uuid, &signal).await;
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(2), ctrl_recv.read_to_end(0))
+                            .await;
+                } else {
+                    let _ = ctrl_send.finish();
+                }
+                emit_control_event(&self.event_tx, transfer_uuid, signal.clone());
+                return Err(control_error(transfer_uuid, signal.action));
+            }
+        };
 
         let _ = progress_stop.send(true);
-        if let Some(pt) = progress_task {
-            let _ = pt.join().await;
-        }
+        let _ = progress_task.join().await;
 
         let bytes_sent = bytes_sent_counter.load(Ordering::Relaxed);
         let complete = Message::Complete(CompletePayload {
@@ -1337,18 +2420,57 @@ impl TransferEngine {
             file_hashes: file_hashes.clone(),
         });
         write_frame(&mut ctrl_send, &complete).await?;
-        ctrl_send
-            .finish()
-            .map_err(|e| TransferError::Quic(e.to_string()))?;
 
-        // Wait for receiver verification & atomic rename confirmation
-        match read_frame(&mut ctrl_recv).await? {
+        // Keep `ctrl_send` open until after the ack/control handshake so late
+        // pause/cancel triggered while the receiver flushes disk buffers still
+        // reaches the receiver over the control stream.
+        let ack_msg = tokio::select! {
+            biased;
+            _ = ctrl_rx.changed(), if ctrl_rx.borrow().is_some() => {
+                let signal = ctrl_rx.borrow().clone().expect("checked is_some");
+                send_control_frame(&mut ctrl_send, transfer_uuid, &signal).await;
+                let _ = ctrl_send.finish();
+                match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut ctrl_recv)).await {
+                    Ok(Ok(Message::Complete(ack))) if ack.transfer_id == transfer_uuid => {
+                        Message::Complete(ack)
+                    }
+                    _ => {
+                        ctrl_guard.remove_now().await;
+                        emit_control_event(&self.event_tx, transfer_uuid, signal.clone());
+                        return Err(control_error(transfer_uuid, signal.action));
+                    }
+                }
+            }
+            res = read_frame(&mut ctrl_recv) => {
+                let _ = ctrl_send.finish();
+                res?
+            }
+        };
+        ctrl_guard.remove_now().await;
+
+        match ack_msg {
             Message::Complete(ack) if ack.transfer_id == transfer_uuid => {
                 if !ack.verified {
                     return Err(TransferError::IntegrityMismatch {
                         relative_path: source_path.display().to_string(),
                     });
                 }
+            }
+            Message::Pause(p) => {
+                let signal = ControlSignal {
+                    action: ControlAction::Pause,
+                    reason: p.reason.or_else(|| Some("Paused by receiver".to_string())),
+                };
+                emit_control_event(&self.event_tx, transfer_uuid, signal);
+                return Err(TransferError::Paused(transfer_uuid));
+            }
+            Message::Cancel(c) => {
+                let signal = ControlSignal {
+                    action: ControlAction::Cancel,
+                    reason: c.reason.or_else(|| Some("Cancelled by receiver".to_string())),
+                };
+                emit_control_event(&self.event_tx, transfer_uuid, signal);
+                return Err(TransferError::Cancelled(transfer_uuid));
             }
             other => {
                 return Err(TransferError::UnexpectedMessage(format!(
@@ -1378,6 +2500,53 @@ impl TransferEngine {
             elapsed: start.elapsed(),
             file_hashes,
         })
+    }
+}
+
+async fn send_control_frame(ctrl_send: &mut SendStream, transfer_id: Uuid, signal: &ControlSignal) {
+    let payload = TransferControlPayload {
+        transfer_id,
+        reason: signal.reason.clone(),
+    };
+    let msg = match signal.action {
+        ControlAction::Pause => Message::Pause(payload),
+        ControlAction::Cancel => Message::Cancel(payload),
+    };
+    let _ = write_frame(ctrl_send, &msg).await;
+    let _ = ctrl_send.finish();
+}
+
+fn emit_control_event(
+    event_tx: &broadcast::Sender<TransferEvent>,
+    transfer_id: Uuid,
+    signal: ControlSignal,
+) {
+    let ev = match signal.action {
+        ControlAction::Pause => TransferEvent::Paused {
+            transfer_id,
+            reason: signal.reason,
+        },
+        ControlAction::Cancel => TransferEvent::Cancelled {
+            transfer_id,
+            reason: signal.reason,
+        },
+    };
+    let _ = event_tx.send(ev);
+}
+
+fn control_error(transfer_id: Uuid, action: ControlAction) -> TransferError {
+    match action {
+        ControlAction::Pause => TransferError::Paused(transfer_id),
+        ControlAction::Cancel => TransferError::Cancelled(transfer_id),
+    }
+}
+
+async fn remove_partial_files(files: &[PartialFilePaths]) {
+    for entry in files {
+        let _ = tokio::fs::remove_file(&entry.part_path).await;
+        let _ = tokio::fs::remove_file(&entry.resume_path).await;
+        let tmp = append_suffix(&entry.resume_path, ".tmp");
+        let _ = tokio::fs::remove_file(&tmp).await;
     }
 }
 
@@ -1411,7 +2580,7 @@ async fn run_incoming_writer(
     total_bytes: u64,
     initial_skipped_bytes: u64,
     mut chunk_rx: mpsc::Receiver<IncomingChunk>,
-    mut cancel_rx: watch::Receiver<bool>,
+    mut stop_rx: watch::Receiver<WriterStop>,
     event_tx: broadcast::Sender<TransferEvent>,
 ) -> Result<Vec<CompletedFileInfo>, TransferError> {
     let mut index_map = HashMap::with_capacity(files.len());
@@ -1426,22 +2595,33 @@ async fn run_incoming_writer(
 
     if remaining_chunks > 0 {
         loop {
+            let stop_state = *stop_rx.borrow();
+            if stop_state == WriterStop::Cancel {
+                return Err(TransferError::Cancelled(transfer_id));
+            }
+            if stop_state == WriterStop::Pause {
+                break;
+            }
+
             let next_chunk = tokio::select! {
                 biased;
-                chunk = chunk_rx.recv() => chunk,
-                _ = cancel_rx.changed() => {
-                    if *cancel_rx.borrow() {
-                        // Drain anything already buffered in chunk_rx before exiting
-                        while let Ok(c) = chunk_rx.try_recv() {
-                            if let Some(&idx) = index_map.get(&c.file_index) {
-                                let state = &mut files[idx];
-                                let _ = write_incoming_chunk(state, c, &mut scratch_buf, &mut remaining_chunks, &mut received_bytes).await?;
+                _ = stop_rx.changed() => {
+                    let current_stop = *stop_rx.borrow();
+                    match current_stop {
+                        WriterStop::Cancel => return Err(TransferError::Cancelled(transfer_id)),
+                        WriterStop::Pause => {
+                            while let Ok(c) = chunk_rx.try_recv() {
+                                if let Some(&idx) = index_map.get(&c.file_index) {
+                                    let state = &mut files[idx];
+                                    let _ = write_incoming_chunk(state, c, &mut scratch_buf, &mut remaining_chunks, &mut received_bytes).await?;
+                                }
                             }
+                            break;
                         }
-                        break;
+                        WriterStop::Running => continue,
                     }
-                    continue;
                 }
+                chunk = chunk_rx.recv() => chunk,
             };
 
             let Some(chunk) = next_chunk else {
@@ -1492,10 +2672,18 @@ async fn run_incoming_writer(
         }
     }
 
+    if *stop_rx.borrow() == WriterStop::Cancel {
+        return Err(TransferError::Cancelled(transfer_id));
+    }
+
     // Flush written chunks and persist resume bitmaps cleanly
     for f in &mut files {
         f.file.flush().await?;
         f.resume.save(&f.resume_path)?;
+    }
+
+    if *stop_rx.borrow() == WriterStop::Pause && remaining_chunks > 0 {
+        return Err(TransferError::Paused(transfer_id));
     }
 
     if remaining_chunks > 0 {
@@ -1851,5 +3039,82 @@ mod tests {
         assert!(sanitize_relative_path("/etc/passwd").is_err());
         assert!(sanitize_relative_path("C:\\windows\\win.ini").is_err());
         assert!(sanitize_relative_path("").is_err());
+    }
+
+    #[test]
+    fn test_wan_daily_key_rotation_midnight_boundary_and_aad() {
+        let tid = Uuid::new_v4();
+        let secret = [0x42u8; 32];
+        let day = 20_500u64;
+        let payload = b"secret-wan-chunk-payload";
+
+        let sender = WanCipherContext::new_for_utc_day(tid, secret, day);
+        let ciphertext = sender.encrypt_chunk(1, 262_144, payload).expect("encrypt");
+        assert_eq!(ciphertext.len(), payload.len() + WAN_CHUNK_OVERHEAD);
+
+        // Same day succeeds
+        let receiver_same_day = WanCipherContext::new_for_utc_day(tid, secret, day);
+        assert_eq!(
+            receiver_same_day
+                .decrypt_chunk(1, 262_144, &ciphertext)
+                .unwrap(),
+            payload
+        );
+
+        // Next UTC day (day + 1) gracefully accepts `day` via its `day - 1` window
+        let receiver_next_day = WanCipherContext::new_for_utc_day(tid, secret, day + 1);
+        assert_eq!(
+            receiver_next_day
+                .decrypt_chunk(1, 262_144, &ciphertext)
+                .unwrap(),
+            payload
+        );
+
+        // Two days later is rejected cleanly
+        let receiver_expired = WanCipherContext::new_for_utc_day(tid, secret, day + 2);
+        assert!(receiver_expired
+            .decrypt_chunk(1, 262_144, &ciphertext)
+            .is_err());
+
+        // Mismatched AAD metadata (file_index or byte_offset or transfer_id) fails authentication
+        assert!(receiver_same_day
+            .decrypt_chunk(2, 262_144, &ciphertext)
+            .is_err());
+        assert!(receiver_same_day
+            .decrypt_chunk(1, 131_072, &ciphertext)
+            .is_err());
+        let wrong_tid = WanCipherContext::new_for_utc_day(Uuid::new_v4(), secret, day);
+        assert!(wrong_tid.decrypt_chunk(1, 262_144, &ciphertext).is_err());
+
+        // Different shared secret fails authentication
+        let wrong_secret = WanCipherContext::new_for_utc_day(tid, [0x99u8; 32], day);
+        assert!(wrong_secret.decrypt_chunk(1, 262_144, &ciphertext).is_err());
+    }
+
+    #[test]
+    fn test_is_local_lan_ip_classification() {
+        use crate::discovery::is_local_lan_ip;
+        use std::net::IpAddr;
+
+        for lan in [
+            "192.168.1.42",
+            "10.0.0.5",
+            "172.16.0.1",
+            "172.31.255.254",
+            "169.254.1.2",
+            "127.0.0.1",
+            "::1",
+            "fe80::1",
+            "fd12:3456::1",
+            "::ffff:192.168.1.5",
+        ] {
+            let ip: IpAddr = lan.parse().unwrap();
+            assert!(is_local_lan_ip(&ip), "expected {lan} to be classified as LAN");
+        }
+
+        for wan in ["8.8.8.8", "1.1.1.1", "172.32.0.1", "100.64.0.1", "2001:4860:4860::8888"] {
+            let ip: IpAddr = wan.parse().unwrap();
+            assert!(!is_local_lan_ip(&ip), "expected {wan} to be classified as WAN");
+        }
     }
 }
