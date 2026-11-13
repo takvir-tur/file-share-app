@@ -1,0 +1,6 @@
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "link-arg=-isysroot",
+    "-C", "link-arg=/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk",
+    "-C", "link-arg=-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk",
+]

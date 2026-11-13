@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">"BeamDrop"</string>
+    <string name="main_activity_title">"BeamDrop"</string>
+    <string name="qs_tile_label">"BeamDrop"</string>
+</resources>

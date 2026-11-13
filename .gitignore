@@ -1,0 +1,11 @@
+target/
+node_modules/
+dist/
+release/
+src-tauri/gen/android/.gradle/
+src-tauri/gen/android/build/
+src-tauri/gen/android/app/build/
+src-tauri/gen/android/app/src/main/jniLibs/
+src-tauri/gen/android/.kotlin/
+src-tauri/gen/android/buildSrc/.kotlin/
+.DS_Store

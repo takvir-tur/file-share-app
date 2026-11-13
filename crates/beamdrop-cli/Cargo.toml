@@ -1,0 +1,19 @@
+[package]
+name = "beamdrop-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "beamdrop"
+path = "src/main.rs"
+
+[dependencies]
+beamdrop-core = { path = "../beamdrop-core" }
+tokio.workspace = true
+iroh.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+indicatif.workspace = true
+
