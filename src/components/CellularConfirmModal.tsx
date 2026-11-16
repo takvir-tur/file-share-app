@@ -41,14 +41,14 @@ export function CellularConfirmModal({
             <div className="stack g8">
               <span className="badge b-wn" style={{ inlineSize: "fit-content" }}>
                 <WarningIcon size={14} />
-                <span>Mobile Data Safeguard</span>
+                <span>Mobile Data Warning</span>
               </span>
-              <h2 id={titleId}>Send Over Cellular Data?</h2>
+              <h2 id={titleId}>Send over mobile data?</h2>
             </div>
           </header>
 
           <p className="m0">
-            You are on mobile data — sending <strong>{formatMbText(pending.totalBytes)}</strong> over long distance will use cellular data.
+            You are on cellular data — sending <strong>{formatMbText(pending.totalBytes)}</strong> over the internet will use your mobile data plan.
           </p>
 
           <div className="panel-box stack g8">
@@ -61,8 +61,8 @@ export function CellularConfirmModal({
               <strong>{pending.paths.length} item(s) · {formatBytes(pending.totalBytes)}</strong>
             </div>
             <div className="sb">
-              <span className="mu">Encryption</span>
-              <span>Daily ChaCha20-Poly1305</span>
+              <span className="mu">Connection</span>
+              <span>Over Internet · Encrypted</span>
             </div>
           </div>
 
@@ -71,7 +71,7 @@ export function CellularConfirmModal({
               Cancel
             </button>
             <button type="button" className="btn bp" disabled={busy} onClick={onConfirm}>
-              Send via Internet
+              Send Anyway
             </button>
           </div>
         </div>

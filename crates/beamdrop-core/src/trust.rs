@@ -47,6 +47,18 @@ fn default_allow_wan() -> bool {
     false
 }
 
+fn default_auto_accept_wan() -> bool {
+    false
+}
+
+/// Incoming offer auto-accept policy evaluated per connection transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferApproval {
+    AutoAccept,
+    AskReceiver,
+    RejectWanDisabled,
+}
+
 fn default_wan_shared_secret() -> [u8; 32] {
     [0u8; 32]
 }
@@ -63,6 +75,9 @@ pub struct TrustedPeer {
     /// Explicitly opts this contact into long-distance WAN/relay transfers (defaults to `false`).
     #[serde(default = "default_allow_wan")]
     pub allow_wan: bool,
+    /// Auto-accept incoming long-distance (WAN) offers without prompting (defaults to `false`).
+    #[serde(default = "default_auto_accept_wan")]
+    pub auto_accept_wan: bool,
     /// Locally derived 256-bit secret (Ed25519->X25519 Diffie-Hellman) for daily WAN key rotation.
     #[serde(default = "default_wan_shared_secret")]
     pub wan_shared_secret: [u8; 32],
@@ -235,7 +250,9 @@ impl TrustStore {
         let mut guard = self.inner.write().await;
         refresh_if_modified(&mut guard);
 
-        let existing_allow_wan = guard.peers.get(&node_id).is_some_and(|p| p.allow_wan);
+        let existing = guard.peers.get(&node_id);
+        let existing_allow_wan = existing.is_some_and(|p| p.allow_wan);
+        let existing_auto_accept_wan = existing.is_some_and(|p| p.auto_accept_wan);
         let wan_shared_secret = match guard.local_secret_key {
             Some(secret) => derive_wan_shared_secret(&secret, &node_id)?,
             None => [0u8; 32],
@@ -248,6 +265,7 @@ impl TrustStore {
             paired_at_unix: now_unix_secs(),
             auto_accept,
             allow_wan: existing_allow_wan,
+            auto_accept_wan: existing_auto_accept_wan,
             wan_shared_secret,
         };
         guard.peers.insert(node_id, entry.clone());
@@ -310,6 +328,20 @@ impl TrustStore {
         (derived != [0u8; 32]).then_some(derived)
     }
 
+    /// Returns `true` when `node_id` is trusted and has `allow_wan == true`.
+    pub async fn peer_allows_wan(&self, node_id: &NodeId) -> bool {
+        let mut guard = self.inner.write().await;
+        refresh_if_modified(&mut guard);
+        guard.peers.get(node_id).is_some_and(|p| p.allow_wan)
+    }
+
+    /// Returns the stored friendly alias for a paired peer, if present.
+    pub async fn peer_display_name(&self, node_id: &NodeId) -> Option<String> {
+        let mut guard = self.inner.write().await;
+        refresh_if_modified(&mut guard);
+        guard.peers.get(node_id).map(|p| p.friendly_alias.clone())
+    }
+
     /// Removes a trusted peer by `NodeId` and persists `trusted_peers.json`.
     pub async fn remove_peer(&self, node_id: &NodeId) -> Result<Option<TrustedPeer>, TrustError> {
         let mut guard = self.inner.write().await;
@@ -340,11 +372,58 @@ impl TrustStore {
         }
     }
 
+    /// Updates per-contact LAN and WAN auto-accept flags, returning `true` if found.
+    pub async fn set_peer_auto_accept(
+        &self,
+        node_id: &NodeId,
+        lan_auto: bool,
+        wan_auto: bool,
+    ) -> Result<bool, TrustError> {
+        let mut guard = self.inner.write().await;
+        refresh_if_modified(&mut guard);
+
+        if let Some(peer) = guard.peers.get_mut(node_id) {
+            peer.auto_accept = lan_auto;
+            peer.auto_accept_wan = wan_auto;
+            save_inner(&mut guard)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Decides how an incoming offer from `node_id` should be handled given the transport.
+    /// Self-trust always auto-accepts; LAN honours `auto_accept`; WAN requires `allow_wan`
+    /// and auto-accepts only when `auto_accept_wan` is also enabled.
+    pub async fn offer_approval(&self, node_id: &NodeId, is_lan: bool) -> OfferApproval {
+        if *node_id == self.local_node_id {
+            return OfferApproval::AutoAccept;
+        }
+        let mut guard = self.inner.write().await;
+        refresh_if_modified(&mut guard);
+        let Some(peer) = guard.peers.get(node_id) else {
+            return OfferApproval::AskReceiver;
+        };
+        evaluate_offer_approval(peer, is_lan)
+    }
+
     /// Looks up a paired device by `NodeId`.
     pub async fn get_peer(&self, node_id: &NodeId) -> Option<TrustedPeer> {
         let mut guard = self.inner.write().await;
         refresh_if_modified(&mut guard);
-        guard.peers.get(node_id).cloned()
+        let local_secret = guard.local_secret_key;
+        let peer = guard.peers.get_mut(node_id)?;
+        if peer.wan_shared_secret == [0u8; 32] {
+            if let Some(secret) = local_secret {
+                if let Ok(derived) = derive_wan_shared_secret(&secret, node_id) {
+                    peer.wan_shared_secret = derived;
+                    let snapshot = peer.clone();
+                    let _ = save_inner(&mut guard);
+                    return Some(snapshot);
+                }
+            }
+        }
+        Some(peer.clone())
     }
 
     /// Reads and sorts a snapshot of `trusted_peers.json` from disk without creating files.
@@ -386,6 +465,42 @@ impl TrustStore {
         let mut guard = self.inner.write().await;
         refresh_if_modified(&mut guard);
         guard.peers.get(node_id).is_some_and(|p| p.auto_accept)
+    }
+
+    /// Returns the currently active, unexpired pairing session when `force_new == false`,
+    /// or creates a new 5-minute session (`created_new == true`) when missing, expired, or `force_new == true`.
+    pub async fn get_or_start_pairing_session(
+        &self,
+        node_id: NodeId,
+        lan_addr: SocketAddr,
+        force_new: bool,
+    ) -> (PairingSession, bool) {
+        let now = Instant::now();
+        let now_secs = now_unix_secs();
+        let mut guard = self.inner.write().await;
+
+        if !force_new {
+            if let Some(ref session) = guard.active_pairing {
+                if now <= session.expires_at && now_secs < session.expires_at_unix {
+                    return (session.clone(), false);
+                }
+            }
+        }
+
+        let pin = generate_6_digit_pin();
+        let expires_at_unix = now_secs.saturating_add(PAIRING_PIN_TTL.as_secs());
+        let uri = format_pairing_uri(node_id, lan_addr, &pin);
+        let session = PairingSession {
+            node_id,
+            addr: lan_addr,
+            pin,
+            uri,
+            created_at_unix: now_secs,
+            expires_at_unix,
+            expires_at: now + PAIRING_PIN_TTL,
+        };
+        guard.active_pairing = Some(session.clone());
+        (session, true)
     }
 
     /// Generates a new one-time 6-digit pairing PIN (valid for 5 minutes) and compact pairing URI.
@@ -439,6 +554,21 @@ impl TrustStore {
     pub async fn cancel_pairing_session(&self) {
         let mut guard = self.inner.write().await;
         guard.active_pairing = None;
+    }
+
+    /// Clears the active pairing session only if its PIN still matches `expected_pin`.
+    pub async fn expire_pairing_session_if_matches(&self, expected_pin: &str) -> bool {
+        let mut guard = self.inner.write().await;
+        if guard
+            .active_pairing
+            .as_ref()
+            .is_some_and(|s| s.pin == expected_pin)
+        {
+            guard.active_pairing = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// Verifies `pin` against the active pairing session and consumes the session on success
@@ -569,6 +699,24 @@ fn decode_basic_uri_component(s: &str) -> String {
         .replace("%5b", "[")
         .replace("%5D", "]")
         .replace("%5d", "]")
+}
+
+/// Pure policy: LAN honours `auto_accept`; WAN needs `allow_wan` and auto-accepts only with `auto_accept_wan`.
+pub fn evaluate_offer_approval(peer: &TrustedPeer, is_lan: bool) -> OfferApproval {
+    if is_lan {
+        return if peer.auto_accept {
+            OfferApproval::AutoAccept
+        } else {
+            OfferApproval::AskReceiver
+        };
+    }
+    if !peer.allow_wan {
+        OfferApproval::RejectWanDisabled
+    } else if peer.auto_accept_wan {
+        OfferApproval::AutoAccept
+    } else {
+        OfferApproval::AskReceiver
+    }
 }
 
 fn now_unix_secs() -> u64 {
@@ -739,6 +887,32 @@ mod tests {
             .await
             .is_err());
 
+        // Zero-padded leading-zero PINs preserve all 6 characters across format & parse
+        let padded_uri = format_pairing_uri(local_id, addr, "004219");
+        let parsed_padded = parse_pairing_uri(&padded_uri).expect("parse leading-zero URI");
+        assert_eq!(parsed_padded.pin, "004219");
+
+        // Immutable active session when force_new == false; regenerated when force_new == true
+        let (first, created1) = store
+            .get_or_start_pairing_session(local_id, addr, false)
+            .await;
+        assert!(created1);
+        let (same, created2) = store
+            .get_or_start_pairing_session(local_id, addr, false)
+            .await;
+        assert!(!created2);
+        assert_eq!(same.pin, first.pin);
+        assert_eq!(same.uri, first.uri);
+        assert_eq!(same.expires_at_unix, first.expires_at_unix);
+
+        let (regenerated, created3) = store
+            .get_or_start_pairing_session(local_id, addr, true)
+            .await;
+        assert!(created3);
+        assert_eq!(regenerated.pin.len(), 6);
+        assert!(store.expire_pairing_session_if_matches(&regenerated.pin).await);
+        assert!(store.active_pairing_session().await.is_none());
+
         // Expired session fails
         let expired = store
             .start_pairing_session_with_ttl(local_id, addr, Duration::from_millis(1))
@@ -780,20 +954,42 @@ mod tests {
             .await
             .expect("Bob trusts Alice");
 
-        // allow_wan defaults to false and both sides derive identical X25519 shared secrets locally
+        // allow_wan and auto_accept_wan default to false; LAN auto-accepts while WAN asks receiver once allow_wan is enabled
         assert!(!peer_on_a.allow_wan);
+        assert!(!peer_on_a.auto_accept_wan);
         assert!(!peer_on_b.allow_wan);
+        assert!(!peer_on_b.auto_accept_wan);
+        assert_eq!(
+            store_a.offer_approval(&bob.node_id, true).await,
+            OfferApproval::AutoAccept
+        );
+        assert_eq!(
+            store_a.offer_approval(&bob.node_id, false).await,
+            OfferApproval::RejectWanDisabled
+        );
         assert_ne!(peer_on_a.wan_shared_secret, [0u8; 32]);
         assert_eq!(peer_on_a.wan_shared_secret, peer_on_b.wan_shared_secret);
         assert!(!store_a.any_wan_enabled().await);
         assert!(store_a.wan_secret_if_allowed(&bob.node_id).await.is_none());
 
-        // Toggling allow_wan ON enables wan_secret_if_allowed and persists across reload
+        // Toggling allow_wan ON enables wan_secret_if_allowed and asks receiver by default on WAN
         assert!(store_a
             .set_peer_wan_enabled(&bob.node_id, true)
             .await
             .unwrap());
         assert!(store_a.any_wan_enabled().await);
+        assert_eq!(
+            store_a.offer_approval(&bob.node_id, false).await,
+            OfferApproval::AskReceiver
+        );
+        assert!(store_a
+            .set_peer_auto_accept(&bob.node_id, true, true)
+            .await
+            .unwrap());
+        assert_eq!(
+            store_a.offer_approval(&bob.node_id, false).await,
+            OfferApproval::AutoAccept
+        );
         assert_eq!(
             store_a.wan_secret_if_allowed(&bob.node_id).await,
             Some(peer_on_a.wan_shared_secret)

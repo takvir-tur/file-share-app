@@ -14,7 +14,7 @@
 		</dict>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>BeamDrop discovers nearby trusted devices and transfers files directly over your local Wi-Fi network.</string>
+	<string>ZapDrop discovers nearby trusted devices and transfers files directly over your local Wi-Fi network.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_beamdrop._udp</string>

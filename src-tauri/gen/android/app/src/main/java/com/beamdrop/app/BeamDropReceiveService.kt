@@ -105,7 +105,7 @@ class BeamDropReceiveService : Service() {
 
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "BeamDrop Background Receiver",
+            "ZapDrop Background Receiver",
             NotificationManager.IMPORTANCE_LOW
         ).apply {
             description = "Keeps Wi-Fi mDNS discovery and peer-to-peer transfers ready"
@@ -128,8 +128,8 @@ class BeamDropReceiveService : Service() {
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_qs_beamdrop)
-            .setContentTitle("BeamDrop Ready")
-            .setContentText("BeamDrop Ready — Listening on Wi-Fi")
+            .setContentTitle("ZapDrop Ready")
+            .setContentText("ZapDrop Ready — Listening on Wi-Fi")
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setOngoing(true)

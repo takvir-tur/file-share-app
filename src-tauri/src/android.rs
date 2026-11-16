@@ -365,12 +365,38 @@ pub extern "system" fn Java_com_beamdrop_app_BeamDropBridge_nativeQueuePairingUr
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_beamdrop_app_BeamDropBridge_nativeRespondToOffer<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    transfer_id: JString<'local>,
+    accept: jni::sys::jboolean,
+) {
+    let id = match env.get_string(&transfer_id) {
+        Ok(s) => s.to_string_lossy().trim().to_string(),
+        Err(_) => {
+            clear_jni_exception(&mut env);
+            return;
+        }
+    };
+    if id.is_empty() {
+        return;
+    }
+    let accepted = accept != 0;
+    if let Some(app) = ANDROID_APP_HANDLE.get().cloned() {
+        tauri::async_runtime::spawn(async move {
+            let state = app.state::<crate::commands::AppState>();
+            let _ = crate::commands::process_offer_response(&app, state.inner(), &id, accepted)
+                .await;
+        });
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_beamdrop_app_BeamDropBridge_nativeGetTrustedPeersJson<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
-    let peers = if let Some(app) = ANDROID_APP_HANDLE.get() {
-        let trust = clone_trust_store(app);
+    let peers = if let Some(trust) = ANDROID_APP_HANDLE.get().and_then(clone_trust_store) {
         tauri::async_runtime::block_on(async move { trust.list_peers().await })
     } else if let Some(dir) = ANDROID_CONFIG_DIR.get() {
         let store_path = dir.join(beamdrop_core::TRUSTED_PEERS_FILENAME);
@@ -412,8 +438,12 @@ pub extern "system" fn Java_com_beamdrop_app_BeamDropBridge_nativeGetTrustedPeer
     }
 }
 
-fn clone_trust_store(app: &AppHandle) -> std::sync::Arc<beamdrop_core::TrustStore> {
-    std::sync::Arc::clone(app.state::<AppState>().node.trust_store())
+fn clone_trust_store(app: &AppHandle) -> Option<std::sync::Arc<beamdrop_core::TrustStore>> {
+    app.state::<AppState>()
+        .node
+        .try_read()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|node| std::sync::Arc::clone(node.trust_store())))
 }
 
 fn query_android_files_dir(env: &mut JNIEnv<'_>) -> Option<PathBuf> {
@@ -506,6 +536,45 @@ pub fn open_public_downloads() -> Result<(), String> {
         Ok(())
     })
     .map_err(|err| format!("Failed to open Android Downloads folder: {err}"))
+}
+
+/// Posts a high-importance heads-up Android notification for an incoming transfer request.
+pub fn show_incoming_transfer_notification(
+    transfer_id: &str,
+    title: &str,
+    body: &str,
+) -> Result<(), String> {
+    with_app_class("com.beamdrop.app.BeamDropBridge", |env, context, bridge_cls| {
+        let j_transfer_id = env.new_string(transfer_id)?;
+        let j_title = env.new_string(title)?;
+        let j_body = env.new_string(body)?;
+        env.call_static_method(
+            bridge_cls,
+            "showIncomingTransferNotification",
+            "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Object(context),
+                JValue::Object(&j_transfer_id),
+                JValue::Object(&j_title),
+                JValue::Object(&j_body),
+            ],
+        )?;
+        Ok(())
+    })
+    .map_err(|err| format!("Failed to show Android incoming notification: {err}"))
+}
+
+/// Dismisses any visible incoming transfer heads-up notification on Android.
+pub fn dismiss_incoming_transfer_notification() {
+    let _ = with_app_class("com.beamdrop.app.BeamDropBridge", |env, context, bridge_cls| {
+        env.call_static_method(
+            bridge_cls,
+            "dismissIncomingTransferNotification",
+            "(Landroid/content/Context;)V",
+            &[JValue::Object(context)],
+        )?;
+        Ok(())
+    });
 }
 
 fn notify_completed_transfer_jni(

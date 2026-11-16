@@ -53,12 +53,10 @@ export function OsIcon({ osType, size = 20, ...rest }: { osType: string } & Icon
   );
 }
 
-export const RadarIcon = (p: IconProps) => (
-  <Svg size={18} {...p}>
-    <circle cx="12" cy="12" r="9" />
-    <circle cx="12" cy="12" r="5" />
-    <circle cx="12" cy="12" r="1.2" fill="currentColor" />
-    <path d="M12 12 18.4 5.6" />
+export const WifiIcon = (p: IconProps) => (
+  <Svg size={14} {...p}>
+    <path d="M2.5 9a13.5 13.5 0 0 1 19 0M6 12.5a8.5 8.5 0 0 1 12 0M9.5 16a3.5 3.5 0 0 1 5 0" />
+    <circle cx="12" cy="19.2" r="1" fill="currentColor" stroke="none" />
   </Svg>
 );
 
@@ -132,12 +130,6 @@ export const PauseIcon = (p: IconProps) => (
 export const PlayIcon = (p: IconProps) => (
   <Svg size={14} {...p}>
     <path d="M7 5.5v13l11-6.5Z" />
-  </Svg>
-);
-
-export const RefreshIcon = (p: IconProps) => (
-  <Svg size={14} {...p}>
-    <path d="M20 11a8 8 0 0 0-14.5-4.5M4 4v4.5h4.5M4 13a8 8 0 0 0 14.5 4.5M20 20v-4.5h-4.5" />
   </Svg>
 );
 

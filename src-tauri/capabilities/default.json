@@ -2,9 +2,12 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for BeamDrop main window and shared plugins",
-  "windows": ["main"],
+  "windows": ["main", "incoming-banner"],
   "permissions": [
     "core:default",
+    "core:window:allow-hide",
+    "core:window:allow-close",
+    "core:window:allow-show",
     "dialog:default",
     "notification:default",
     "opener:default"

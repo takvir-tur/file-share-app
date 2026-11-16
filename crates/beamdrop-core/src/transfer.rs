@@ -25,16 +25,21 @@ use uuid::Uuid;
 
 #[cfg(not(target_os = "android"))]
 use crate::identity::DeviceIdentity;
-use crate::discovery::is_endpoint_connection_lan;
 use crate::protocol::{
     read_frame, transfer_stream_id, write_frame, AcceptPayload, AcceptedFileResume, ChunkRange,
     CompletePayload, FileHashEntry, FileOfferEntry, Message, OfferPayload, ProtocolError,
     RejectPayload, TransferControlPayload,
 };
-use crate::trust::TrustStore;
+use crate::trust::{OfferApproval, TrustStore};
 
 /// Chunk size used for bounded disk streaming, incremental BLAKE3 hashing, and resume tracking.
 pub const CHUNK_SIZE: usize = 128 * 1024; // 128 KiB
+
+/// Maximum payload chunk size for Over-Internet (`!is_lan`) WAN streams (`4 * CHUNK_SIZE`).
+pub const WAN_CHUNK_SIZE: usize = 512 * 1024; // 512 KiB
+
+/// Exact number of 128 KiB resume blocks carried by a full `WAN_CHUNK_SIZE` chunk.
+pub const WAN_BLOCKS_PER_CHUNK: usize = WAN_CHUNK_SIZE / CHUNK_SIZE;
 
 /// File/transfer threshold above which parallel QUIC uni-stream striping is enabled.
 pub const PARALLEL_STRIPE_THRESHOLD: u64 = 32 * 1024 * 1024; // 32 MiB
@@ -44,6 +49,9 @@ pub const MAX_PARALLEL_STREAMS: usize = 6;
 
 /// Bounded channel capacity (`24 * 128 KiB = 3 MiB`) keeping total RAM well under 15 MB.
 pub const CHANNEL_BOUND: usize = 24;
+
+/// Bounded channel capacity for pipelined WAN chunks (`12 * 512 KiB = 6 MiB`).
+pub const WAN_CHANNEL_BOUND: usize = 12;
 
 /// Fixed big-endian header length preceding every chunk on unidirectional data streams.
 /// Layout: `[u64 transfer_id | u32 file_index | u64 byte_offset | u32 chunk_len]`.
@@ -100,6 +108,17 @@ pub enum TransferError {
     Cancelled(Uuid),
 }
 
+impl TransferError {
+    /// Returns `true` when an active transfer failed due to a recoverable transport/QUIC drop
+    /// rather than rejection, cancellation, or payload verification failure.
+    pub fn is_recoverable_network_drop(&self) -> bool {
+        matches!(
+            self,
+            Self::Quic(_) | Self::Protocol(_) | Self::DisconnectedMidTransfer { .. }
+        )
+    }
+}
+
 /// 24-byte big-endian chunk header written on unidirectional QUIC streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkHeader {
@@ -145,6 +164,8 @@ pub struct TransferProgress {
     pub bytes_skipped_resumed: u64,
     pub total_bytes: u64,
     pub streams_active: usize,
+    pub is_wan: bool,
+    pub is_direct: Option<bool>,
 }
 
 /// Summary returned upon successful completion of a transfer.
@@ -160,6 +181,13 @@ pub struct TransferSummary {
     pub file_hashes: Vec<FileHashEntry>,
 }
 
+/// Direction of a transfer reported in lifecycle events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferDirection {
+    Outgoing,
+    Incoming,
+}
+
 /// Events published by `TransferEngine` over a `tokio::sync::broadcast` channel.
 #[derive(Debug, Clone)]
 pub enum TransferEvent {
@@ -171,6 +199,16 @@ pub enum TransferEvent {
         files: usize,
         total_bytes: u64,
         bytes_skipped_resumed: u64,
+    },
+    AwaitingApproval {
+        transfer_id: Uuid,
+        peer_node_id: NodeId,
+        peer_name: String,
+        file_name: String,
+        files: usize,
+        total_bytes: u64,
+        is_wan: bool,
+        expires_at_unix_ms: u64,
     },
     OfferReceived {
         transfer_id: Uuid,
@@ -189,8 +227,12 @@ pub enum TransferEvent {
         transfer_id: Uuid,
         sender_node_id: NodeId,
         sender_name: String,
+        file_name: String,
         files: usize,
         total_bytes: u64,
+        /// `true` when the offer arrived over an Internet (WAN/relay) path rather than local LAN.
+        is_wan: bool,
+        expires_at_unix_ms: u64,
     },
     Progress(TransferProgress),
     Paused {
@@ -209,6 +251,17 @@ pub enum TransferEvent {
         bytes_skipped_resumed: u64,
         verified: bool,
         output_dir: Option<PathBuf>,
+    },
+    Failed {
+        transfer_id: Uuid,
+        direction: TransferDirection,
+        peer_node_id: NodeId,
+        peer_name: String,
+        file_name: String,
+        files: usize,
+        total_bytes: u64,
+        is_wan: Option<bool>,
+        reason: String,
     },
     Interrupted {
         transfer_id: Uuid,
@@ -486,15 +539,29 @@ struct IncomingChunk {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ControlAction {
+pub(crate) enum ControlAction {
     Pause,
     Cancel,
 }
 
 #[derive(Debug, Clone)]
-struct ControlSignal {
-    action: ControlAction,
-    reason: Option<String>,
+pub(crate) struct ControlSignal {
+    pub(crate) action: ControlAction,
+    pub(crate) reason: Option<String>,
+}
+
+async fn recv_control_signal(rx: &mut watch::Receiver<Option<ControlSignal>>) -> ControlSignal {
+    loop {
+        if let Some(sig) = rx.borrow_and_update().clone() {
+            return sig;
+        }
+        if rx.changed().await.is_err() {
+            return ControlSignal {
+                action: ControlAction::Cancel,
+                reason: Some("Transfer control channel closed".to_string()),
+            };
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -522,6 +589,91 @@ pub fn current_utc_day() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() / 86_400)
         .unwrap_or(0)
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn derive_primary_offer_name(files: &[FileOfferEntry]) -> String {
+    if files.is_empty() {
+        return "Incoming items".to_string();
+    }
+    if files.len() == 1 {
+        return Path::new(&files[0].relative_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&files[0].relative_path)
+            .to_string();
+    }
+    let first_root = files[0]
+        .relative_path
+        .split(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty());
+    if let Some(root) = first_root {
+        let same_folder = files.iter().all(|f| {
+            let rel = f.relative_path.as_str();
+            rel.starts_with(&format!("{root}/")) || rel.starts_with(&format!("{root}\\"))
+        });
+        if same_folder {
+            return root.to_string();
+        }
+    }
+    Path::new(&files[0].relative_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&files[0].relative_path)
+        .to_string()
+}
+
+/// Computes a fast pre-dial summary `(primary_name, files_count, total_bytes)` for `source`
+/// so the UI can enter `Connecting` immediately with accurate item metadata.
+pub async fn preview_source_summary(source: &Path) -> Result<(String, usize, u64), TransferError> {
+    let meta = tokio::fs::metadata(source).await?;
+    let fallback_name = source
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Transfer item")
+        .to_string();
+    if meta.is_file() {
+        return Ok((fallback_name, 1, meta.len()));
+    }
+    if !meta.is_dir() {
+        return Err(TransferError::EmptySource(source.to_path_buf()));
+    }
+    let source_owned = source.to_path_buf();
+    let name_clone = fallback_name.clone();
+    let (count, total_bytes) = tokio::task::spawn_blocking(move || -> std::io::Result<(usize, u64)> {
+        let mut stack = vec![source_owned];
+        let mut files = 0usize;
+        let mut bytes = 0u64;
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let md = entry.metadata()?;
+                if md.is_dir() {
+                    stack.push(entry.path());
+                } else if md.is_file() {
+                    files += 1;
+                    bytes = bytes.saturating_add(md.len());
+                }
+            }
+        }
+        Ok((files, bytes))
+    })
+    .await
+    .map_err(|e| TransferError::Quic(e.to_string()))??;
+    if count == 0 {
+        return Err(TransferError::EmptySource(source.to_path_buf()));
+    }
+    Ok((name_clone, count, total_bytes))
 }
 
 /// Derives a 256-bit daily-rotating key from `wan_shared_secret` and `utc_day`.
@@ -681,6 +833,7 @@ struct ActiveIncomingTransfer {
     chunk_tx: mpsc::Sender<IncomingChunk>,
     stop_tx: watch::Sender<WriterStop>,
     wan_cipher: Option<Arc<WanCipherContext>>,
+    max_chunk_payload: usize,
 }
 
 struct ControlMapGuard {
@@ -709,6 +862,36 @@ impl ControlMapGuard {
     }
 }
 
+/// Active control registration handle created before dialing so Cancel/Pause works even while Connecting.
+pub struct PreControlHandle {
+    pub(crate) ctrl_rx: watch::Receiver<Option<ControlSignal>>,
+    guard: ControlMapGuard,
+}
+
+impl PreControlHandle {
+    pub fn paused_or_cancelled_action(&self) -> Option<(&'static str, Option<String>)> {
+        self.ctrl_rx.borrow().as_ref().map(|sig| {
+            let kind = match sig.action {
+                ControlAction::Pause => "pause",
+                ControlAction::Cancel => "cancel",
+            };
+            (kind, sig.reason.clone())
+        })
+    }
+
+    pub async fn wait_control_signal(&mut self) {
+        while self.ctrl_rx.borrow().is_none() {
+            if self.ctrl_rx.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+
+    pub async fn release(mut self) {
+        self.guard.remove_now().await;
+    }
+}
+
 impl Drop for ControlMapGuard {
     fn drop(&mut self) {
         if !self.disarmed {
@@ -724,6 +907,7 @@ pub struct TransferEngine {
     download_dir: PathBuf,
     trust_store: Option<Arc<TrustStore>>,
     shared_endpoint: StdRwLock<Option<Arc<StdRwLock<Option<Endpoint>>>>>,
+    shared_peer_table: StdRwLock<Option<Arc<RwLock<crate::discovery::PeerTable>>>>,
     pending_approvals: Arc<Mutex<HashMap<Uuid, oneshot::Sender<bool>>>>,
     approval_timeout: RwLock<Duration>,
     active_incoming: Arc<RwLock<HashMap<u64, ActiveIncomingTransfer>>>,
@@ -755,6 +939,7 @@ impl TransferEngine {
             download_dir: dir,
             trust_store,
             shared_endpoint: StdRwLock::new(None),
+            shared_peer_table: StdRwLock::new(None),
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
             approval_timeout: RwLock::new(DEFAULT_APPROVAL_TIMEOUT),
             active_incoming: Arc::new(RwLock::new(HashMap::new())),
@@ -771,20 +956,50 @@ impl TransferEngine {
         *self.shared_endpoint.write().expect("shared_endpoint rwlock") = Some(endpoint);
     }
 
-    fn is_connection_lan(&self, remote_node_id: NodeId) -> bool {
+    /// Attaches `DiscoveryEngine`'s live LAN `PeerTable` so incoming/outgoing transfers
+    /// classify active mDNS/LAN peers accurately even before `conn_type` finishes settling.
+    pub fn attach_peer_table(&self, peer_table: Arc<RwLock<crate::discovery::PeerTable>>) {
+        *self
+            .shared_peer_table
+            .write()
+            .expect("shared_peer_table rwlock") = Some(peer_table);
+    }
+
+    async fn is_connection_lan(&self, conn: Option<&Connection>, remote_node_id: NodeId) -> bool {
         let maybe_ep_lock = self
             .shared_endpoint
             .read()
             .expect("shared_endpoint rwlock")
             .clone();
-        match maybe_ep_lock {
-            Some(ep_lock) => match ep_lock.read().expect("endpoint rwlock").as_ref() {
-                Some(ep) => is_endpoint_connection_lan(ep, remote_node_id),
-                None => false,
-            },
+        let table_snapshot = self
+            .shared_peer_table
+            .read()
+            .expect("shared_peer_table rwlock")
+            .clone();
+        if maybe_ep_lock.is_none() && table_snapshot.is_none() {
             // Standalone unit/integration harnesses without DiscoveryEngine run directly on localhost LAN.
-            None => true,
+            return true;
         }
+        let ep_snapshot = maybe_ep_lock
+            .as_ref()
+            .and_then(|shared| shared.read().expect("endpoint rwlock").clone());
+        crate::discovery::is_connection_lan_with_table(
+            ep_snapshot.as_ref(),
+            conn,
+            table_snapshot.as_ref(),
+            remote_node_id,
+        )
+        .await
+    }
+
+    async fn is_connection_direct(&self, remote_node_id: NodeId) -> Option<bool> {
+        let maybe_ep_lock = self
+            .shared_endpoint
+            .read()
+            .expect("shared_endpoint rwlock")
+            .clone()?;
+        let ep_snapshot = maybe_ep_lock.read().expect("endpoint rwlock").clone()?;
+        crate::discovery::is_endpoint_connection_direct(&ep_snapshot, remote_node_id)
     }
 
     /// Configures the approval wait timeout for untrusted offers (defaults to 60 seconds).
@@ -809,6 +1024,14 @@ impl TransferEngine {
     /// Returns the IDs of offers currently awaiting approval.
     pub async fn pending_offer_ids(&self) -> Vec<Uuid> {
         self.pending_approvals.lock().await.keys().copied().collect()
+    }
+
+    /// Returns `true` if any transfer is currently active, pending approval, or paused.
+    pub async fn has_in_flight_transfers(&self) -> bool {
+        !self.active_controls.read().await.is_empty()
+            || !self.active_incoming.read().await.is_empty()
+            || !self.pending_approvals.lock().await.is_empty()
+            || !self.paused_incoming.read().await.is_empty()
     }
 
     /// Returns the configured download output directory.
@@ -899,11 +1122,90 @@ impl TransferEngine {
             .map(|info| info.sender_node_id)
     }
 
+    /// Emits an outgoing/incoming control event (`Paused` or `Cancelled`) for a `PreControlHandle`.
+    pub fn emit_control_for_pre_control(&self, transfer_id: Uuid, kind: &str, reason: Option<String>) {
+        match kind {
+            "pause" => self.emit_paused(transfer_id, reason),
+            _ => self.emit_cancelled(transfer_id, reason),
+        }
+    }
+
     /// Emits a `TransferEvent::Cancelled` notification for a transfer managed at the node level.
     pub fn emit_cancelled(&self, transfer_id: Uuid, reason: Option<String>) {
         let _ = self
             .event_tx
             .send(TransferEvent::Cancelled { transfer_id, reason });
+    }
+
+    /// Emits a `TransferEvent::Paused` notification for a transfer managed at the node level.
+    pub fn emit_paused(&self, transfer_id: Uuid, reason: Option<String>) {
+        let _ = self
+            .event_tx
+            .send(TransferEvent::Paused { transfer_id, reason });
+    }
+
+    /// Emits a `TransferEvent::Started` notification right when an outgoing transfer enters Connecting.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_started(
+        &self,
+        transfer_id: Uuid,
+        peer_node_id: NodeId,
+        peer_name: String,
+        file_name: String,
+        files: usize,
+        total_bytes: u64,
+        bytes_skipped_resumed: u64,
+    ) {
+        let _ = self.event_tx.send(TransferEvent::Started {
+            transfer_id,
+            peer_node_id,
+            peer_name,
+            file_name,
+            files,
+            total_bytes,
+            bytes_skipped_resumed,
+        });
+    }
+
+    /// Emits a `TransferEvent::Failed` notification with full item metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_failed(
+        &self,
+        transfer_id: Uuid,
+        direction: TransferDirection,
+        peer_node_id: NodeId,
+        peer_name: String,
+        file_name: String,
+        files: usize,
+        total_bytes: u64,
+        is_wan: Option<bool>,
+        reason: String,
+    ) {
+        let _ = self.event_tx.send(TransferEvent::Failed {
+            transfer_id,
+            direction,
+            peer_node_id,
+            peer_name,
+            file_name,
+            files,
+            total_bytes,
+            is_wan,
+            reason,
+        });
+    }
+
+    /// Registers a `ControlSignal` channel for `transfer_id` before dialing starts so Cancel/Pause
+    /// works immediately in `Connecting` state.
+    pub async fn register_control(&self, transfer_id: Uuid) -> PreControlHandle {
+        let (ctrl_tx, ctrl_rx) = watch::channel::<Option<ControlSignal>>(None);
+        {
+            let mut controls = self.active_controls.write().await;
+            controls.insert(transfer_id, ctrl_tx);
+        }
+        PreControlHandle {
+            ctrl_rx,
+            guard: ControlMapGuard::new(transfer_id, Arc::clone(&self.active_controls)),
+        }
     }
 
     /// Handles an out-of-band `Pause` or `Cancel` control message received after a transfer paused.
@@ -1001,6 +1303,7 @@ impl TransferEngine {
         let mut cached_stop_tx: Option<watch::Sender<WriterStop>> = None;
         let mut cached_stop: Option<watch::Receiver<WriterStop>> = None;
         let mut cached_cipher: Option<Arc<WanCipherContext>> = None;
+        let mut cached_max_payload: usize = CHUNK_SIZE;
 
         loop {
             if let Some(ref stop_rx) = cached_stop {
@@ -1019,7 +1322,7 @@ impl TransferEngine {
             }
 
             let hdr = ChunkHeader::decode(&header_buf);
-            if hdr.chunk_len == 0 || hdr.chunk_len as usize > CHUNK_SIZE + WAN_CHUNK_OVERHEAD {
+            if hdr.chunk_len == 0 || hdr.chunk_len as usize > WAN_CHUNK_SIZE + WAN_CHUNK_OVERHEAD {
                 break;
             }
 
@@ -1031,15 +1334,16 @@ impl TransferEngine {
                     cached_stop_tx = Some(sink.stop_tx.clone());
                     cached_stop = Some(sink.stop_tx.subscribe());
                     cached_cipher = sink.wan_cipher.clone();
+                    cached_max_payload = sink.max_chunk_payload;
                 } else {
                     break;
                 }
             }
 
             let max_wire = if cached_cipher.is_some() {
-                CHUNK_SIZE + WAN_CHUNK_OVERHEAD
+                cached_max_payload + WAN_CHUNK_OVERHEAD
             } else {
-                CHUNK_SIZE
+                cached_max_payload
             };
             let min_wire = if cached_cipher.is_some() {
                 WAN_CHUNK_OVERHEAD + 1
@@ -1095,6 +1399,7 @@ impl TransferEngine {
     ) {
         let transfer_uuid = offer.transfer_id;
         let stream_tid = transfer_stream_id(transfer_uuid);
+        let primary_file_name = derive_primary_offer_name(&offer.files);
         let sender_node_id = match conn.remote_node_id() {
             Ok(id) => id,
             Err(err) => {
@@ -1114,8 +1419,18 @@ impl TransferEngine {
             }
         };
 
-        let is_lan = self.is_connection_lan(sender_node_id);
-        let wan_cipher = if !is_lan || offer.wan_encrypted {
+        let display_sender_name = match &self.trust_store {
+            Some(store) => store
+                .peer_display_name(&sender_node_id)
+                .await
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| offer.sender_name.clone()),
+            None => offer.sender_name.clone(),
+        };
+
+        let is_lan = self.is_connection_lan(Some(&conn), sender_node_id).await;
+        let is_wan_path = !is_lan || offer.wan_encrypted;
+        let wan_cipher = if is_wan_path {
             let maybe_secret = match &self.trust_store {
                 Some(store) => store.wan_secret_if_allowed(&sender_node_id).await,
                 None => None,
@@ -1130,10 +1445,17 @@ impl TransferEngine {
                 });
                 let _ = write_frame(&mut ctrl_send, &reject).await;
                 let _ = ctrl_send.finish();
-                let _ = self.event_tx.send(TransferEvent::Interrupted {
-                    transfer_id: transfer_uuid,
+                self.emit_failed(
+                    transfer_uuid,
+                    TransferDirection::Incoming,
+                    sender_node_id,
+                    display_sender_name,
+                    primary_file_name,
+                    offer.files.len(),
+                    offer.total_bytes,
+                    Some(true),
                     reason,
-                });
+                );
                 return;
             };
             if !is_lan && !offer.wan_encrypted {
@@ -1146,10 +1468,17 @@ impl TransferEngine {
                 });
                 let _ = write_frame(&mut ctrl_send, &reject).await;
                 let _ = ctrl_send.finish();
-                let _ = self.event_tx.send(TransferEvent::Interrupted {
-                    transfer_id: transfer_uuid,
+                self.emit_failed(
+                    transfer_uuid,
+                    TransferDirection::Incoming,
+                    sender_node_id,
+                    display_sender_name,
+                    primary_file_name,
+                    offer.files.len(),
+                    offer.total_bytes,
+                    Some(true),
                     reason,
-                });
+                );
                 return;
             }
             Some(Arc::new(WanCipherContext::new(transfer_uuid, secret)))
@@ -1173,14 +1502,18 @@ impl TransferEngine {
 
         let _ = self.event_tx.send(TransferEvent::OfferReceived {
             transfer_id: transfer_uuid,
-            sender_name: offer.sender_name.clone(),
+            sender_name: display_sender_name.clone(),
             files: offer.files.len(),
             total_bytes: offer.total_bytes,
         });
 
+        let is_wan = is_wan_path;
         let auto_accept = was_previously_approved_pause
             || match &self.trust_store {
-                Some(store) => store.is_auto_accept_trusted(&sender_node_id).await,
+                Some(store) => matches!(
+                    store.offer_approval(&sender_node_id, !is_wan).await,
+                    OfferApproval::AutoAccept
+                ),
                 None => false,
             };
 
@@ -1188,7 +1521,7 @@ impl TransferEngine {
             let _ = self.event_tx.send(TransferEvent::AutoAccepted {
                 transfer_id: transfer_uuid,
                 sender_node_id,
-                sender_name: offer.sender_name.clone(),
+                sender_name: display_sender_name.clone(),
                 files: offer.files.len(),
                 total_bytes: offer.total_bytes,
             });
@@ -1199,12 +1532,18 @@ impl TransferEngine {
                 pending.insert(transfer_uuid, tx);
             }
 
+            let wait_dur = *self.approval_timeout.read().await;
+            let expires_at_unix_ms = now_unix_ms().saturating_add(wait_dur.as_millis() as u64);
+
             let _ = self.event_tx.send(TransferEvent::PendingApproval {
                 transfer_id: transfer_uuid,
                 sender_node_id,
-                sender_name: offer.sender_name.clone(),
+                sender_name: display_sender_name.clone(),
+                file_name: primary_file_name.clone(),
                 files: offer.files.len(),
                 total_bytes: offer.total_bytes,
+                is_wan,
+                expires_at_unix_ms,
             });
 
             enum ApprovalOutcome {
@@ -1216,12 +1555,11 @@ impl TransferEngine {
                 },
             }
 
-            let wait_dur = *self.approval_timeout.read().await;
             let outcome = tokio::select! {
                 biased;
-                _ = ctrl_rx.changed(), if ctrl_rx.borrow().is_some() => {
+                signal = recv_control_signal(&mut ctrl_rx) => {
                     ApprovalOutcome::Control {
-                        signal: ctrl_rx.borrow().clone().expect("checked is_some"),
+                        signal,
                         initiated_locally: true,
                     }
                 }
@@ -1292,10 +1630,17 @@ impl TransferEngine {
                     });
                     let _ = write_frame(&mut ctrl_send, &reject).await;
                     let _ = ctrl_send.finish();
-                    let _ = self.event_tx.send(TransferEvent::Interrupted {
-                        transfer_id: transfer_uuid,
+                    self.emit_failed(
+                        transfer_uuid,
+                        TransferDirection::Incoming,
+                        sender_node_id,
+                        display_sender_name,
+                        primary_file_name,
+                        offer.files.len(),
+                        offer.total_bytes,
+                        Some(is_wan),
                         reason,
-                    });
+                    );
                     return;
                 }
             }
@@ -1347,7 +1692,13 @@ impl TransferEngine {
             });
         }
 
-        let (chunk_tx, chunk_rx) = mpsc::channel::<IncomingChunk>(CHANNEL_BOUND);
+        let max_chunk_payload = if is_wan { WAN_CHUNK_SIZE } else { CHUNK_SIZE };
+        let inbound_channel_bound = if is_wan {
+            WAN_CHANNEL_BOUND
+        } else {
+            CHANNEL_BOUND
+        };
+        let (chunk_tx, chunk_rx) = mpsc::channel::<IncomingChunk>(inbound_channel_bound);
         let (stop_tx, stop_rx) = watch::channel(WriterStop::Running);
 
         {
@@ -1359,12 +1710,22 @@ impl TransferEngine {
                     chunk_tx: chunk_tx.clone(),
                     stop_tx: stop_tx.clone(),
                     wan_cipher,
+                    max_chunk_payload,
                 },
             );
         }
 
+        let shared_endpoint = self
+            .shared_endpoint
+            .read()
+            .expect("shared_endpoint rwlock")
+            .clone();
         let mut writer_handle = tokio::spawn(run_incoming_writer(
             transfer_uuid,
+            sender_node_id,
+            is_wan,
+            max_chunk_payload,
+            shared_endpoint,
             prepared,
             remaining_chunks,
             offer.total_bytes,
@@ -1393,13 +1754,20 @@ impl TransferEngine {
             return;
         }
 
-        if initial_skipped_bytes > 0 {
+        if initial_skipped_bytes > 0 || !first_file_name.is_empty() {
+            let initial_is_direct = if is_wan {
+                self.is_connection_direct(sender_node_id).await
+            } else {
+                None
+            };
             let _ = self.event_tx.send(TransferEvent::Progress(TransferProgress {
                 transfer_id: transfer_uuid,
                 file_name: first_file_name,
                 bytes_transferred: 0,
                 bytes_skipped_resumed: initial_skipped_bytes,
                 total_bytes: offer.total_bytes,
+                is_wan,
+                is_direct: initial_is_direct,
                 streams_active: if offer.total_bytes > PARALLEL_STRIPE_THRESHOLD {
                     MAX_PARALLEL_STREAMS
                 } else {
@@ -1420,9 +1788,9 @@ impl TransferEngine {
 
         let wait_result = tokio::select! {
             biased;
-            _ = ctrl_rx.changed(), if ctrl_rx.borrow().is_some() => {
+            signal = recv_control_signal(&mut ctrl_rx) => {
                 IncomingWaitResult::Control {
-                    signal: ctrl_rx.borrow().clone().expect("checked is_some"),
+                    signal,
                     initiated_locally: true,
                 }
             }
@@ -1494,15 +1862,25 @@ impl TransferEngine {
             }
             IncomingWaitResult::Disconnected(reason) => {
                 ctrl_guard.remove_now().await;
-                {
-                    let mut active = self.active_incoming.write().await;
-                    active.remove(&stream_tid);
-                }
+                self.cleanup_active_transfer(stream_tid, &stop_tx, WriterStop::Pause)
+                    .await;
                 drop(chunk_tx);
                 let _ = tokio::time::timeout(Duration::from_secs(2), writer_handle).await;
+                self.paused_incoming.write().await.insert(
+                    transfer_uuid,
+                    PausedIncomingInfo {
+                        sender_node_id,
+                        partial_files,
+                    },
+                );
+                let display_reason = if !is_wan {
+                    "Wi-Fi disconnected — tap Resume when back online".to_string()
+                } else {
+                    reason
+                };
                 let _ = self.event_tx.send(TransferEvent::Interrupted {
                     transfer_id: transfer_uuid,
-                    reason,
+                    reason: display_reason,
                 });
                 return;
             }
@@ -1515,8 +1893,7 @@ impl TransferEngine {
         let writer_res = loop {
             tokio::select! {
                 biased;
-                _ = ctrl_rx.changed(), if ctrl_rx.borrow().is_some() => {
-                    let signal = ctrl_rx.borrow().clone().expect("checked is_some");
+                signal = recv_control_signal(&mut ctrl_rx) => {
                     self.finish_incoming_control_stop(
                         transfer_uuid,
                         sender_node_id,
@@ -1598,13 +1975,21 @@ impl TransferEngine {
             }
         };
 
-        // Always remove active sink and control entries now that writer finished.
-        ctrl_guard.remove_now().await;
-        {
+        if writer_res.is_err() {
+            drop(chunk_tx);
+            let _ = tokio::time::timeout(Duration::from_secs(2), writer_handle).await;
+            ctrl_guard.remove_now().await;
             let mut active = self.active_incoming.write().await;
             active.remove(&stream_tid);
+        } else {
+            // Always remove active sink and control entries now that writer finished.
+            ctrl_guard.remove_now().await;
+            {
+                let mut active = self.active_incoming.write().await;
+                active.remove(&stream_tid);
+            }
+            drop(chunk_tx);
         }
-        drop(chunk_tx);
 
         match writer_res {
             Ok(computed_files) => {
@@ -1707,9 +2092,24 @@ impl TransferEngine {
                 );
             }
             Err(err) => {
+                let recoverable = err.is_recoverable_network_drop();
+                if recoverable {
+                    self.paused_incoming.write().await.insert(
+                        transfer_uuid,
+                        PausedIncomingInfo {
+                            sender_node_id,
+                            partial_files,
+                        },
+                    );
+                }
+                let reason = if recoverable && !is_wan {
+                    "Wi-Fi disconnected — tap Resume when back online".to_string()
+                } else {
+                    err.to_string()
+                };
                 let _ = self.event_tx.send(TransferEvent::Interrupted {
                     transfer_id: transfer_uuid,
-                    reason: err.to_string(),
+                    reason,
                 });
             }
         }
@@ -1918,31 +2318,92 @@ impl TransferEngine {
         progress_tx: Option<mpsc::Sender<TransferProgress>>,
         force_wan_encryption: Option<bool>,
     ) -> Result<TransferSummary, TransferError> {
+        self.send_path_with_control_and_wan(
+            conn,
+            sender_name,
+            source_path,
+            peer_name,
+            transfer_id_override,
+            progress_tx,
+            force_wan_encryption,
+            None,
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Sends a single file or recursive directory reusing a pre-registered `PreControlHandle`
+    /// and emitting `AwaitingApproval` and `Failed` lifecycle events on the sender side.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_path_with_control_and_wan(
+        &self,
+        conn: &Connection,
+        sender_name: &str,
+        source_path: &Path,
+        peer_name: Option<&str>,
+        transfer_id_override: Option<Uuid>,
+        progress_tx: Option<mpsc::Sender<TransferProgress>>,
+        force_wan_encryption: Option<bool>,
+        pre_control: Option<PreControlHandle>,
+        connected_via_lan_hint: Option<bool>,
+        emit_started_event: bool,
+    ) -> Result<TransferSummary, TransferError> {
         let start = Instant::now();
-        let manifest = collect_transfer_manifest(source_path).await?;
         let transfer_uuid = transfer_id_override.unwrap_or_else(Uuid::new_v4);
         let stream_tid = transfer_stream_id(transfer_uuid);
-        let total_bytes: u64 = manifest.iter().map(|m| m.offer_entry.size_bytes).sum();
         let peer_node_id = conn
             .remote_node_id()
             .map_err(|e| TransferError::Quic(e.to_string()))?;
 
-        let encrypt_wan = force_wan_encryption.unwrap_or_else(|| !self.is_connection_lan(peer_node_id));
-        let wan_cipher = if encrypt_wan {
-            let secret = match &self.trust_store {
-                Some(store) => store.wan_secret_if_allowed(&peer_node_id).await,
-                None => None,
-            };
-            let Some(secret) = secret else {
-                return Err(TransferError::WanDisallowed(
-                    "Long-distance transfers are disabled for this contact".to_string(),
-                ));
-            };
-            Some(Arc::new(WanCipherContext::new(transfer_uuid, secret)))
-        } else {
-            None
+        let peer_label = match &self.trust_store {
+            Some(store) => store
+                .peer_display_name(&peer_node_id)
+                .await
+                .filter(|s| !s.trim().is_empty()),
+            None => None,
+        }
+        .or_else(|| peer_name.map(ToString::to_string))
+        .unwrap_or_else(|| peer_node_id.to_string());
+
+        let (mut ctrl_rx, mut ctrl_guard) = match pre_control {
+            Some(handle) => (handle.ctrl_rx, handle.guard),
+            None => {
+                let (ctrl_tx, ctrl_rx) = watch::channel::<Option<ControlSignal>>(None);
+                {
+                    let mut controls = self.active_controls.write().await;
+                    controls.insert(transfer_uuid, ctrl_tx);
+                }
+                let guard =
+                    ControlMapGuard::new(transfer_uuid, Arc::clone(&self.active_controls));
+                (ctrl_rx, guard)
+            }
         };
 
+        let manifest = match collect_transfer_manifest(source_path).await {
+            Ok(m) => m,
+            Err(err) => {
+                ctrl_guard.remove_now().await;
+                let fallback_name = source_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Transfer item")
+                    .to_string();
+                self.emit_failed(
+                    transfer_uuid,
+                    TransferDirection::Outgoing,
+                    peer_node_id,
+                    peer_label,
+                    fallback_name,
+                    1,
+                    0,
+                    None,
+                    err.to_string(),
+                );
+                return Err(err);
+            }
+        };
+        let total_bytes: u64 = manifest.iter().map(|m| m.offer_entry.size_bytes).sum();
         let primary_name = source_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -1954,24 +2415,66 @@ impl TransferEngine {
                     .unwrap_or_default()
             });
 
-        let (ctrl_tx, mut ctrl_rx) = watch::channel::<Option<ControlSignal>>(None);
-        {
-            let mut controls = self.active_controls.write().await;
-            controls.insert(transfer_uuid, ctrl_tx);
+        if emit_started_event {
+            self.emit_started(
+                transfer_uuid,
+                peer_node_id,
+                peer_label.clone(),
+                primary_name.clone(),
+                manifest.len(),
+                total_bytes,
+                0,
+            );
         }
-        let mut ctrl_guard = ControlMapGuard::new(transfer_uuid, Arc::clone(&self.active_controls));
 
-        let _ = self.event_tx.send(TransferEvent::Started {
-            transfer_id: transfer_uuid,
-            peer_node_id,
-            peer_name: peer_name
-                .map(ToString::to_string)
-                .unwrap_or_else(|| peer_node_id.to_string()),
-            file_name: primary_name,
-            files: manifest.len(),
-            total_bytes,
-            bytes_skipped_resumed: 0,
-        });
+        let initial_signal = ctrl_rx.borrow().clone();
+        if let Some(signal) = initial_signal {
+            ctrl_guard.remove_now().await;
+            emit_control_event(&self.event_tx, transfer_uuid, signal.clone());
+            return Err(control_error(transfer_uuid, signal.action));
+        }
+
+        let mut is_lan = self.is_connection_lan(Some(conn), peer_node_id).await;
+        if connected_via_lan_hint == Some(false) {
+            let endpoint_direct = self
+                .shared_endpoint
+                .read()
+                .expect("shared_endpoint rwlock")
+                .as_ref()
+                .and_then(|shared| shared.read().expect("endpoint rwlock").clone())
+                .is_some_and(|ep| crate::discovery::is_endpoint_connection_lan(&ep, peer_node_id));
+            if !endpoint_direct {
+                is_lan = false;
+            }
+        }
+        let encrypt_wan = force_wan_encryption.unwrap_or(!is_lan);
+        let wan_cipher = if encrypt_wan {
+            let secret = match &self.trust_store {
+                Some(store) => store.wan_secret_if_allowed(&peer_node_id).await,
+                None => None,
+            };
+            let Some(secret) = secret else {
+                ctrl_guard.remove_now().await;
+                let msg = "Long-distance transfers are disabled for this contact".to_string();
+                self.emit_failed(
+                    transfer_uuid,
+                    TransferDirection::Outgoing,
+                    peer_node_id,
+                    peer_label,
+                    primary_name,
+                    manifest.len(),
+                    total_bytes,
+                    Some(true),
+                    msg.clone(),
+                );
+                return Err(TransferError::WanDisallowed(msg));
+            };
+            Some(Arc::new(WanCipherContext::new(transfer_uuid, secret)))
+        } else {
+            None
+        };
+
+        let is_wan_transfer = !is_lan || wan_cipher.is_some();
 
         let offer = OfferPayload {
             transfer_id: transfer_uuid,
@@ -1981,33 +2484,91 @@ impl TransferEngine {
             wan_encrypted: wan_cipher.is_some(),
         };
 
-        let (mut ctrl_send, mut ctrl_recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| TransferError::Quic(e.to_string()))?;
+        let (mut ctrl_send, mut ctrl_recv) = match conn.open_bi().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                ctrl_guard.remove_now().await;
+                let msg = e.to_string();
+                self.emit_failed(
+                    transfer_uuid,
+                    TransferDirection::Outgoing,
+                    peer_node_id,
+                    peer_label,
+                    primary_name,
+                    manifest.len(),
+                    total_bytes,
+                    Some(is_wan_transfer),
+                    msg.clone(),
+                );
+                return Err(TransferError::Quic(msg));
+            }
+        };
 
-        write_frame(&mut ctrl_send, &Message::Offer(offer)).await?;
+        if let Err(err) = write_frame(&mut ctrl_send, &Message::Offer(offer)).await {
+            ctrl_guard.remove_now().await;
+            let err = TransferError::Protocol(err);
+            self.emit_failed(
+                transfer_uuid,
+                TransferDirection::Outgoing,
+                peer_node_id,
+                peer_label,
+                primary_name,
+                manifest.len(),
+                total_bytes,
+                Some(is_wan_transfer),
+                err.to_string(),
+            );
+            return Err(err);
+        }
+
+        let approval_wait = *self.approval_timeout.read().await;
+        let expires_at_unix_ms = now_unix_ms().saturating_add(approval_wait.as_millis() as u64);
+        let _ = self.event_tx.send(TransferEvent::AwaitingApproval {
+            transfer_id: transfer_uuid,
+            peer_node_id,
+            peer_name: peer_label.clone(),
+            file_name: primary_name.clone(),
+            files: manifest.len(),
+            total_bytes,
+            is_wan: is_wan_transfer,
+            expires_at_unix_ms,
+        });
 
         let accept = tokio::select! {
             biased;
-            _ = ctrl_rx.changed(), if ctrl_rx.borrow().is_some() => {
-                let signal = ctrl_rx.borrow().clone().expect("checked is_some");
+            signal = recv_control_signal(&mut ctrl_rx) => {
                 ctrl_guard.remove_now().await;
                 send_control_frame(&mut ctrl_send, transfer_uuid, &signal).await;
                 emit_control_event(&self.event_tx, transfer_uuid, signal.clone());
                 return Err(control_error(transfer_uuid, signal.action));
             }
-            frame_res = read_frame(&mut ctrl_recv) => {
-                match frame_res? {
-                    Message::Accept(a) => a,
-                    Message::Reject(r) => {
+            frame_res = tokio::time::timeout(approval_wait, read_frame(&mut ctrl_recv)) => {
+                match frame_res {
+                    Ok(Ok(Message::Accept(a))) => a,
+                    Ok(Ok(Message::Reject(r))) => {
                         ctrl_guard.remove_now().await;
-                        return Err(TransferError::Rejected(
+                        let raw_reason = r.reason.unwrap_or_else(|| "No reason given".to_string());
+                        let ui_reason = if raw_reason.to_ascii_lowercase().contains("timed out") {
+                            format!("{peer_label} did not receive the transfer (timed out)")
+                        } else if raw_reason == "Transfer rejected by user" {
+                            format!("{peer_label} declined the transfer")
+                        } else {
+                            raw_reason.clone()
+                        };
+                        self.emit_failed(
                             transfer_uuid,
-                            r.reason.unwrap_or_else(|| "No reason given".to_string()),
-                        ));
+                            TransferDirection::Outgoing,
+                            peer_node_id,
+                            peer_label.clone(),
+                            primary_name.clone(),
+                            manifest.len(),
+                            total_bytes,
+                            Some(is_wan_transfer),
+                            ui_reason,
+                        );
+                        return Err(TransferError::Rejected(transfer_uuid, raw_reason));
                     }
-                    Message::Pause(p) => {
+                    Ok(Ok(Message::Pause(p))) => {
                         ctrl_guard.remove_now().await;
                         let signal = ControlSignal {
                             action: ControlAction::Pause,
@@ -2016,7 +2577,7 @@ impl TransferEngine {
                         emit_control_event(&self.event_tx, transfer_uuid, signal);
                         return Err(TransferError::Paused(transfer_uuid));
                     }
-                    Message::Cancel(c) => {
+                    Ok(Ok(Message::Cancel(c))) => {
                         ctrl_guard.remove_now().await;
                         let signal = ControlSignal {
                             action: ControlAction::Cancel,
@@ -2025,12 +2586,66 @@ impl TransferEngine {
                         emit_control_event(&self.event_tx, transfer_uuid, signal);
                         return Err(TransferError::Cancelled(transfer_uuid));
                     }
-                    other => {
+                    Ok(Ok(other)) => {
                         ctrl_guard.remove_now().await;
-                        return Err(TransferError::UnexpectedMessage(format!(
+                        let err = TransferError::UnexpectedMessage(format!(
                             "{:?}",
                             other.message_type()
-                        )));
+                        ));
+                        self.emit_failed(
+                            transfer_uuid,
+                            TransferDirection::Outgoing,
+                            peer_node_id,
+                            peer_label,
+                            primary_name,
+                            manifest.len(),
+                            total_bytes,
+                            Some(is_wan_transfer),
+                            err.to_string(),
+                        );
+                        return Err(err);
+                    }
+                    Ok(Err(err)) => {
+                        ctrl_guard.remove_now().await;
+                        let err = TransferError::Protocol(err);
+                        self.emit_failed(
+                            transfer_uuid,
+                            TransferDirection::Outgoing,
+                            peer_node_id,
+                            peer_label,
+                            primary_name,
+                            manifest.len(),
+                            total_bytes,
+                            Some(is_wan_transfer),
+                            err.to_string(),
+                        );
+                        return Err(err);
+                    }
+                    Err(_) => {
+                        ctrl_guard.remove_now().await;
+                        send_control_frame(
+                            &mut ctrl_send,
+                            transfer_uuid,
+                            &ControlSignal {
+                                action: ControlAction::Cancel,
+                                reason: Some("Timed out awaiting approval".to_string()),
+                            },
+                        )
+                        .await;
+                        let timeout_reason =
+                            format!("{peer_label} did not receive the transfer (timed out)");
+                        self.emit_failed(
+                            transfer_uuid,
+                            TransferDirection::Outgoing,
+                            peer_node_id,
+                            peer_label,
+                            primary_name,
+                            manifest.len(),
+                            total_bytes,
+                            Some(is_wan_transfer),
+                            timeout_reason.clone(),
+                        );
+                        return Err(TransferError::Rejected(transfer_uuid, timeout_reason));
                     }
                 }
             }
@@ -2087,6 +2702,11 @@ impl TransferEngine {
             .unwrap_or_default();
 
         if bytes_skipped_resumed > 0 {
+            let initial_is_direct = if is_wan_transfer {
+                self.is_connection_direct(peer_node_id).await
+            } else {
+                None
+            };
             let _ = self.event_tx.send(TransferEvent::Progress(TransferProgress {
                 transfer_id: transfer_uuid,
                 file_name: first_file_label.clone(),
@@ -2094,10 +2714,17 @@ impl TransferEngine {
                 bytes_skipped_resumed,
                 total_bytes,
                 streams_active: num_streams,
+                is_wan: is_wan_transfer,
+                is_direct: initial_is_direct,
             }));
         }
 
-        let (chunk_tx, chunk_rx) = mpsc::channel::<OutgoingChunk>(CHANNEL_BOUND);
+        let outbound_channel_bound = if is_wan_transfer {
+            WAN_CHANNEL_BOUND
+        } else {
+            CHANNEL_BOUND
+        };
+        let (chunk_tx, chunk_rx) = mpsc::channel::<OutgoingChunk>(outbound_channel_bound);
         let shared_rx = Arc::new(Mutex::new(chunk_rx));
         let bytes_sent_counter = Arc::new(AtomicU64::new(0));
         let current_file_label = Arc::new(RwLock::new(first_file_label));
@@ -2110,6 +2737,14 @@ impl TransferEngine {
             let mut stop_rx = progress_stop.subscribe();
             let event_tx = self.event_tx.clone();
             let opt_tx = progress_tx;
+            let tick_ep = if is_wan_transfer {
+                self.shared_endpoint
+                    .read()
+                    .expect("shared_endpoint rwlock")
+                    .clone()
+            } else {
+                None
+            };
             AbortOnDrop::new(tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_millis(50));
                 loop {
@@ -2117,6 +2752,19 @@ impl TransferEngine {
                         _ = ticker.tick() => {
                             let cur = sent.load(Ordering::Relaxed);
                             let name = label.read().await.clone();
+                            let is_direct = if is_wan_transfer {
+                                tick_ep
+                                    .as_ref()
+                                    .and_then(|shared| shared.read().expect("endpoint rwlock").clone())
+                                    .and_then(|ep| {
+                                        crate::discovery::is_endpoint_connection_direct(
+                                            &ep,
+                                            peer_node_id,
+                                        )
+                                    })
+                            } else {
+                                None
+                            };
                             let snap = TransferProgress {
                                 transfer_id: transfer_uuid,
                                 file_name: name,
@@ -2124,6 +2772,8 @@ impl TransferEngine {
                                 bytes_skipped_resumed,
                                 total_bytes,
                                 streams_active: num_streams,
+                                is_wan: is_wan_transfer,
+                                is_direct,
                             };
                             if let Some(ref tx) = opt_tx {
                                 let _ = tx.try_send(snap.clone());
@@ -2242,6 +2892,10 @@ impl TransferEngine {
                 let mut hasher = blake3::Hasher::new();
                 let total_chunks = chunk_count_for_size(entry.size_bytes);
                 let mut range_idx = 0usize;
+                // On Same Wi-Fi (`!is_wan_transfer`) every 128 KiB block is forwarded as-is;
+                // on Over-Internet (`is_wan_transfer`) contiguous missing blocks coalesce up to 512 KiB.
+                let mut pending_offset: Option<u64> = None;
+                let mut pending_buf = Vec::with_capacity(if is_wan_transfer { WAN_CHUNK_SIZE } else { 0 });
 
                 for chunk_idx in 0..total_chunks {
                     let expected_len = expected_chunk_len(entry.size_bytes, chunk_idx);
@@ -2257,12 +2911,60 @@ impl TransferEngine {
                         && chunk_idx >= ranges[range_idx].start
                         && chunk_idx < ranges[range_idx].end;
 
-                    if is_missing {
+                    if !is_wan_transfer {
+                        if is_missing {
+                            let outgoing = OutgoingChunk {
+                                file_index: entry.file_id,
+                                byte_offset: chunk_idx * CHUNK_SIZE as u64,
+                                data: Bytes::copy_from_slice(&read_buf[..expected_len]),
+                            };
+                            chunk_tx
+                                .send(outgoing)
+                                .await
+                                .map_err(|_| TransferError::Quic("Worker channel closed".into()))?;
+                        }
+                    } else if is_missing {
+                        if pending_offset.is_none() {
+                            pending_offset = Some(chunk_idx * CHUNK_SIZE as u64);
+                        }
+                        pending_buf.extend_from_slice(&read_buf[..expected_len]);
+                        if pending_buf.len() >= WAN_CHUNK_SIZE {
+                            let offset = pending_offset.take().unwrap_or(chunk_idx * CHUNK_SIZE as u64);
+                            let outgoing = OutgoingChunk {
+                                file_index: entry.file_id,
+                                byte_offset: offset,
+                                data: Bytes::copy_from_slice(&pending_buf),
+                            };
+                            pending_buf.clear();
+                            chunk_tx
+                                .send(outgoing)
+                                .await
+                                .map_err(|_| TransferError::Quic("Worker channel closed".into()))?;
+                        }
+                    } else if let Some(offset) = pending_offset.take() {
+                        if !pending_buf.is_empty() {
+                            let outgoing = OutgoingChunk {
+                                file_index: entry.file_id,
+                                byte_offset: offset,
+                                data: Bytes::copy_from_slice(&pending_buf),
+                            };
+                            pending_buf.clear();
+                            chunk_tx
+                                .send(outgoing)
+                                .await
+                                .map_err(|_| TransferError::Quic("Worker channel closed".into()))?;
+                        }
+                    }
+                }
+
+                if let Some(offset) = pending_offset.take() {
+                    if !pending_buf.is_empty() {
                         let outgoing = OutgoingChunk {
                             file_index: entry.file_id,
-                            byte_offset: chunk_idx * CHUNK_SIZE as u64,
-                            data: Bytes::copy_from_slice(&read_buf[..expected_len]),
+                            byte_offset: offset,
+                            data: Bytes::copy_from_slice(&pending_buf),
                         };
+                        pending_buf.clear();
                         chunk_tx
                             .send(outgoing)
                             .await
@@ -2308,9 +3010,9 @@ impl TransferEngine {
 
         let stage_outcome = tokio::select! {
             biased;
-            _ = ctrl_rx.changed(), if ctrl_rx.borrow().is_some() => {
+            signal = recv_control_signal(&mut ctrl_rx) => {
                 OutgoingStageOutcome::Control {
-                    signal: ctrl_rx.borrow().clone().expect("checked is_some"),
+                    signal,
                     initiated_locally: true,
                 }
             }
@@ -2385,6 +3087,23 @@ impl TransferEngine {
                     }
                 }
                 ctrl_guard.remove_now().await;
+                if !is_wan_transfer && err.is_recoverable_network_drop() {
+                    return Err(TransferError::DisconnectedMidTransfer {
+                        transfer_id: transfer_uuid,
+                        remaining_chunks: 1,
+                    });
+                }
+                self.emit_failed(
+                    transfer_uuid,
+                    TransferDirection::Outgoing,
+                    peer_node_id,
+                    peer_label,
+                    primary_name,
+                    manifest.len(),
+                    total_bytes,
+                    Some(is_wan_transfer),
+                    err.to_string(),
+                );
                 return Err(err);
             }
             OutgoingStageOutcome::Control {
@@ -2419,15 +3138,35 @@ impl TransferEngine {
             verified: true,
             file_hashes: file_hashes.clone(),
         });
-        write_frame(&mut ctrl_send, &complete).await?;
+        if let Err(err) = write_frame(&mut ctrl_send, &complete).await {
+            ctrl_guard.remove_now().await;
+            let err = TransferError::Protocol(err);
+            if !is_wan_transfer {
+                return Err(TransferError::DisconnectedMidTransfer {
+                    transfer_id: transfer_uuid,
+                    remaining_chunks: 1,
+                });
+            }
+            self.emit_failed(
+                transfer_uuid,
+                TransferDirection::Outgoing,
+                peer_node_id,
+                peer_label,
+                primary_name,
+                manifest.len(),
+                total_bytes,
+                Some(is_wan_transfer),
+                err.to_string(),
+            );
+            return Err(err);
+        }
 
         // Keep `ctrl_send` open until after the ack/control handshake so late
         // pause/cancel triggered while the receiver flushes disk buffers still
         // reaches the receiver over the control stream.
         let ack_msg = tokio::select! {
             biased;
-            _ = ctrl_rx.changed(), if ctrl_rx.borrow().is_some() => {
-                let signal = ctrl_rx.borrow().clone().expect("checked is_some");
+            signal = recv_control_signal(&mut ctrl_rx) => {
                 send_control_frame(&mut ctrl_send, transfer_uuid, &signal).await;
                 let _ = ctrl_send.finish();
                 match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut ctrl_recv)).await {
@@ -2443,7 +3182,31 @@ impl TransferEngine {
             }
             res = read_frame(&mut ctrl_recv) => {
                 let _ = ctrl_send.finish();
-                res?
+                match res {
+                    Ok(m) => m,
+                    Err(err) => {
+                        ctrl_guard.remove_now().await;
+                        let err = TransferError::Protocol(err);
+                        if !is_wan_transfer {
+                            return Err(TransferError::DisconnectedMidTransfer {
+                                transfer_id: transfer_uuid,
+                                remaining_chunks: 1,
+                            });
+                        }
+                        self.emit_failed(
+                            transfer_uuid,
+                            TransferDirection::Outgoing,
+                            peer_node_id,
+                            peer_label,
+                            primary_name,
+                            manifest.len(),
+                            total_bytes,
+                            Some(is_wan_transfer),
+                            err.to_string(),
+                        );
+                        return Err(err);
+                    }
+                }
             }
         };
         ctrl_guard.remove_now().await;
@@ -2451,9 +3214,21 @@ impl TransferEngine {
         match ack_msg {
             Message::Complete(ack) if ack.transfer_id == transfer_uuid => {
                 if !ack.verified {
-                    return Err(TransferError::IntegrityMismatch {
+                    let err = TransferError::IntegrityMismatch {
                         relative_path: source_path.display().to_string(),
-                    });
+                    };
+                    self.emit_failed(
+                        transfer_uuid,
+                        TransferDirection::Outgoing,
+                        peer_node_id,
+                        peer_label,
+                        primary_name,
+                        manifest.len(),
+                        total_bytes,
+                        Some(is_wan_transfer),
+                        err.to_string(),
+                    );
+                    return Err(err);
                 }
             }
             Message::Pause(p) => {
@@ -2473,10 +3248,22 @@ impl TransferEngine {
                 return Err(TransferError::Cancelled(transfer_uuid));
             }
             other => {
-                return Err(TransferError::UnexpectedMessage(format!(
+                let err = TransferError::UnexpectedMessage(format!(
                     "{:?}",
                     other.message_type()
-                )));
+                ));
+                self.emit_failed(
+                    transfer_uuid,
+                    TransferDirection::Outgoing,
+                    peer_node_id,
+                    peer_label,
+                    primary_name,
+                    manifest.len(),
+                    total_bytes,
+                    Some(is_wan_transfer),
+                    err.to_string(),
+                );
+                return Err(err);
             }
         }
 
@@ -2573,8 +3360,13 @@ struct CompletedFileInfo {
     computed_blake3: [u8; 32],
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_incoming_writer(
     transfer_id: Uuid,
+    sender_node_id: NodeId,
+    is_wan: bool,
+    max_chunk_payload: usize,
+    shared_endpoint: Option<Arc<StdRwLock<Option<Endpoint>>>>,
     mut files: Vec<FileReceiveState>,
     mut remaining_chunks: u64,
     total_bytes: u64,
@@ -2613,7 +3405,7 @@ async fn run_incoming_writer(
                             while let Ok(c) = chunk_rx.try_recv() {
                                 if let Some(&idx) = index_map.get(&c.file_index) {
                                     let state = &mut files[idx];
-                                    let _ = write_incoming_chunk(state, c, &mut scratch_buf, &mut remaining_chunks, &mut received_bytes).await?;
+                                    let _ = write_incoming_chunk(state, c, max_chunk_payload, &mut scratch_buf, &mut remaining_chunks, &mut received_bytes).await?;
                                 }
                             }
                             break;
@@ -2632,25 +3424,36 @@ async fn run_incoming_writer(
                 continue;
             };
             let state = &mut files[vec_idx];
-            if write_incoming_chunk(
+            chunks_since_flush += write_incoming_chunk(
                 state,
                 chunk,
+                max_chunk_payload,
                 &mut scratch_buf,
                 &mut remaining_chunks,
                 &mut received_bytes,
             )
-            .await?
-            {
-                chunks_since_flush += 1;
-            }
+            .await?;
 
             if chunks_since_flush >= 64 || last_flush.elapsed() >= Duration::from_millis(250) {
-                for f in &mut files {
-                    f.file.flush().await?;
-                    f.resume.save(&f.resume_path)?;
+                if !is_wan {
+                    for f in &mut files {
+                        f.file.flush().await?;
+                        f.resume.save(&f.resume_path)?;
+                    }
                 }
                 chunks_since_flush = 0;
                 last_flush = Instant::now();
+
+                let live_is_direct = if is_wan {
+                    shared_endpoint
+                        .as_ref()
+                        .and_then(|shared| shared.read().expect("endpoint rwlock").clone())
+                        .and_then(|ep| {
+                            crate::discovery::is_endpoint_connection_direct(&ep, sender_node_id)
+                        })
+                } else {
+                    None
+                };
 
                 let _ = event_tx.send(TransferEvent::Progress(TransferProgress {
                     transfer_id,
@@ -2663,6 +3466,8 @@ async fn run_incoming_writer(
                     } else {
                         1
                     },
+                    is_wan,
+                    is_direct: live_is_direct,
                 }));
             }
 
@@ -2715,23 +3520,40 @@ async fn run_incoming_writer(
 async fn write_incoming_chunk(
     state: &mut FileReceiveState,
     chunk: IncomingChunk,
+    max_chunk_payload: usize,
     scratch_buf: &mut [u8],
     remaining_chunks: &mut u64,
     received_bytes: &mut u64,
-) -> Result<bool, TransferError> {
-    if chunk.byte_offset % CHUNK_SIZE as u64 != 0 {
+) -> Result<u64, TransferError> {
+    if chunk.byte_offset % CHUNK_SIZE as u64 != 0
+        || chunk.data.is_empty()
+        || chunk.data.len() > max_chunk_payload
+    {
         return Err(TransferError::InvalidChunkHeader {
             transfer_id: state.file_id as u64,
         });
     }
-    let chunk_idx = chunk.byte_offset / CHUNK_SIZE as u64;
-    if chunk_idx >= state.resume.total_chunks {
+    let first_idx = chunk.byte_offset / CHUNK_SIZE as u64;
+    let data_len = chunk.data.len() as u64;
+    let Some(end_offset) = chunk.byte_offset.checked_add(data_len) else {
+        return Err(TransferError::InvalidChunkHeader {
+            transfer_id: state.file_id as u64,
+        });
+    };
+    if end_offset > state.size_bytes {
         return Err(TransferError::InvalidChunkHeader {
             transfer_id: state.file_id as u64,
         });
     }
-    let expected_len = expected_chunk_len(state.size_bytes, chunk_idx);
-    if chunk.data.len() != expected_len {
+    if chunk.data.len() % CHUNK_SIZE != 0 && end_offset != state.size_bytes {
+        return Err(TransferError::InvalidChunkHeader {
+            transfer_id: state.file_id as u64,
+        });
+    }
+    let block_count = (chunk.data.len() + CHUNK_SIZE - 1) as u64 / CHUNK_SIZE as u64;
+    if first_idx + block_count > state.resume.total_chunks
+        || (max_chunk_payload == CHUNK_SIZE && block_count != 1)
+    {
         return Err(TransferError::InvalidChunkHeader {
             transfer_id: state.file_id as u64,
         });
@@ -2740,20 +3562,28 @@ async fn write_incoming_chunk(
     state.file.seek(SeekFrom::Start(chunk.byte_offset)).await?;
     state.file.write_all(&chunk.data).await?;
 
-    let newly_marked = state.resume.mark_chunk_verified(chunk_idx);
-    if newly_marked {
-        *remaining_chunks = remaining_chunks.saturating_sub(1);
-        *received_bytes += chunk.data.len() as u64;
+    let mut newly_marked_blocks = 0u64;
+    let mut newly_received_bytes = 0u64;
+    for blk_off in 0..block_count {
+        let blk_idx = first_idx + blk_off;
+        if state.resume.mark_chunk_verified(blk_idx) {
+            *remaining_chunks = remaining_chunks.saturating_sub(1);
+            newly_marked_blocks += 1;
+            newly_received_bytes += expected_chunk_len(state.size_bytes, blk_idx) as u64;
+        }
     }
+    *received_bytes += newly_received_bytes;
 
     // Hash immediately in RAM if this chunk sits right at the sequential BLAKE3 frontier
-    if chunk_idx == state.next_hash_chunk {
+    if first_idx == state.next_hash_chunk {
         state.hasher.update(&chunk.data);
-        state.next_hash_chunk += 1;
+        state.next_hash_chunk += block_count;
+        advance_hash_frontier(state, scratch_buf).await?;
+    } else if first_idx < state.next_hash_chunk && first_idx + block_count > state.next_hash_chunk {
         advance_hash_frontier(state, scratch_buf).await?;
     }
 
-    Ok(newly_marked)
+    Ok(newly_marked_blocks)
 }
 
 async fn advance_hash_frontier(
@@ -3105,16 +3935,146 @@ mod tests {
             "127.0.0.1",
             "::1",
             "fe80::1",
-            "fd12:3456::1",
             "::ffff:192.168.1.5",
         ] {
             let ip: IpAddr = lan.parse().unwrap();
             assert!(is_local_lan_ip(&ip), "expected {lan} to be classified as LAN");
         }
 
-        for wan in ["8.8.8.8", "1.1.1.1", "172.32.0.1", "100.64.0.1", "2001:4860:4860::8888"] {
+        for wan in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "172.32.0.1",
+            "100.64.0.1",
+            "2001:4860:4860::8888",
+            "fd12:3456::1",
+            "fd15:070a:510b::1",
+        ] {
             let ip: IpAddr = wan.parse().unwrap();
             assert!(!is_local_lan_ip(&ip), "expected {wan} to be classified as WAN");
         }
+    }
+
+    #[tokio::test]
+    async fn test_wan_512kib_chunk_write_and_cross_granularity_resume() {
+        let dir = std::env::temp_dir().join(format!("beamdrop-wan-chunk-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let size_bytes = (CHUNK_SIZE as u64) * 5 + 12_345; // 5 * 128 KiB + tail
+        let payload: Vec<u8> = (0..size_bytes as usize)
+            .map(|i| ((i.wrapping_mul(31)) ^ (i >> 8)) as u8)
+            .collect();
+        let expected_hash = *blake3::hash(&payload).as_bytes();
+
+        let final_path = dir.join("wan_test.bin");
+        let part_path = part_path_for(&final_path);
+        let resume_path = resume_path_for(&final_path);
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&part_path)
+            .await
+            .unwrap();
+        file.set_len(size_bytes).await.unwrap();
+
+        let resume = ResumeMetadata::new("wan_test.bin".into(), size_bytes, Some(expected_hash));
+        let mut state = FileReceiveState {
+            file_id: 0,
+            relative_path: "wan_test.bin".into(),
+            size_bytes,
+            offer_expected_blake3: Some(expected_hash),
+            final_path,
+            part_path: part_path.clone(),
+            resume_path,
+            resume,
+            file,
+            hasher: blake3::Hasher::new(),
+            next_hash_chunk: 0,
+        };
+        let mut scratch = vec![0u8; CHUNK_SIZE];
+        let mut remaining = state.resume.total_chunks;
+        let mut received = 0u64;
+
+        // First chunk sent on LAN (128 KiB = block 0)
+        let marked_lan = write_incoming_chunk(
+            &mut state,
+            IncomingChunk {
+                file_index: 0,
+                byte_offset: 0,
+                data: payload[..CHUNK_SIZE].to_vec(),
+            },
+            CHUNK_SIZE,
+            &mut scratch,
+            &mut remaining,
+            &mut received,
+        )
+        .await
+        .unwrap();
+        assert_eq!(marked_lan, 1);
+
+        // Oversized chunk must still be rejected on strict LAN path
+        let rejected_lan = write_incoming_chunk(
+            &mut state,
+            IncomingChunk {
+                file_index: 0,
+                byte_offset: CHUNK_SIZE as u64,
+                data: payload[CHUNK_SIZE..CHUNK_SIZE + WAN_CHUNK_SIZE].to_vec(),
+            },
+            CHUNK_SIZE,
+            &mut scratch,
+            &mut remaining,
+            &mut received,
+        )
+        .await;
+        assert!(rejected_lan.is_err());
+
+        // Resume remaining 5 blocks via two WAN chunks (512 KiB = 4 blocks, then final tail block)
+        let first_wan_end = CHUNK_SIZE + WAN_CHUNK_SIZE;
+        let marked_wan_1 = write_incoming_chunk(
+            &mut state,
+            IncomingChunk {
+                file_index: 0,
+                byte_offset: CHUNK_SIZE as u64,
+                data: payload[CHUNK_SIZE..first_wan_end].to_vec(),
+            },
+            WAN_CHUNK_SIZE,
+            &mut scratch,
+            &mut remaining,
+            &mut received,
+        )
+        .await
+        .unwrap();
+        assert_eq!(marked_wan_1, 4);
+
+        let marked_wan_2 = write_incoming_chunk(
+            &mut state,
+            IncomingChunk {
+                file_index: 0,
+                byte_offset: first_wan_end as u64,
+                data: payload[first_wan_end..].to_vec(),
+            },
+            WAN_CHUNK_SIZE,
+            &mut scratch,
+            &mut remaining,
+            &mut received,
+        )
+        .await
+        .unwrap();
+        assert_eq!(marked_wan_2, 1);
+        assert_eq!(remaining, 0);
+        assert_eq!(received, size_bytes);
+        advance_hash_frontier(&mut state, &mut scratch)
+            .await
+            .unwrap();
+        assert_eq!(*state.hasher.finalize().as_bytes(), expected_hash);
+
+        assert!(TransferError::Quic("reset".into()).is_recoverable_network_drop());
+        assert!(
+            !TransferError::Rejected(Uuid::new_v4(), "no".into()).is_recoverable_network_drop()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

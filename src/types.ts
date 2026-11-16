@@ -18,8 +18,11 @@ export interface PeerEntry {
   paired: boolean;
   autoAccept: boolean;
   allowWan: boolean;
+  autoAcceptWan: boolean;
   pairedAtUnix: number | null;
   lastSeenUnixMs: number | null;
+  isLan: boolean;
+  transport: string;
 }
 
 export interface PairingSession {
@@ -37,6 +40,7 @@ export interface TrustedPeer {
   pairedAtUnix: number;
   autoAccept: boolean;
   allowWan: boolean;
+  autoAcceptWan: boolean;
 }
 
 export interface MeasurePathsResult {
@@ -44,10 +48,25 @@ export interface MeasurePathsResult {
   totalBytes: number;
 }
 
+export type TransferStatus =
+  | "connecting"
+  | "awaiting_approval"
+  | "pending_approval"
+  | "offer_received"
+  | "sending"
+  | "receiving"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "interrupted"
+  | "cancelled"
+  | "rejected"
+  | (string & {});
+
 export interface TransferRecord {
   transferId: string;
   direction: string;
-  status: string;
+  status: TransferStatus;
   peerNodeId: string | null;
   peerName: string;
   fileName: string | null;
@@ -61,6 +80,9 @@ export interface TransferRecord {
   outputDir: string | null;
   reason: string | null;
   updatedAtUnixMs: number;
+  isWan?: boolean | null;
+  isDirect?: boolean | null;
+  approvalExpiresAtUnixMs?: number | null;
 }
 
 export interface PeerEventPayload {

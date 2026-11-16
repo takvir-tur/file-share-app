@@ -8,7 +8,8 @@ use beamdrop_core::TrustedPeer;
 use serde::Serialize;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const SHORTCUT_PREFIX: &str = "BeamDrop (";
+const SHORTCUT_PREFIX: &str = "ZapDrop (";
+const LEGACY_SHORTCUT_PREFIX: &str = "BeamDrop (";
 const SHORTCUT_SUFFIX: &str = ").lnk";
 
 #[derive(Serialize)]
@@ -156,9 +157,10 @@ fn remove_stale_shortcuts(sendto_dir: &Path, desired_names_lower: &HashSet<Strin
             continue;
         };
         let lower = name_str.to_ascii_lowercase();
-        let is_beamdrop_lnk = lower.starts_with(&SHORTCUT_PREFIX.to_ascii_lowercase())
+        let is_zapdrop_lnk = (lower.starts_with(&SHORTCUT_PREFIX.to_ascii_lowercase())
+            || lower.starts_with(&LEGACY_SHORTCUT_PREFIX.to_ascii_lowercase()))
             && lower.ends_with(&SHORTCUT_SUFFIX.to_ascii_lowercase());
-        if is_beamdrop_lnk && !desired_names_lower.contains(&lower) {
+        if is_zapdrop_lnk && !desired_names_lower.contains(&lower) {
             let _ = fs::remove_file(entry.path());
         }
     }
@@ -180,7 +182,7 @@ foreach ($item in $items) {
     $shortcut.Arguments = $item.args
     if ($item.workdir) { $shortcut.WorkingDirectory = $item.workdir }
     $shortcut.IconLocation = "$($item.target),0"
-    $shortcut.Description = "Send via BeamDrop"
+    $shortcut.Description = "Send via ZapDrop"
     $shortcut.Save()
 }
 "#;

@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">"BeamDrop"</string>
-    <string name="main_activity_title">"BeamDrop"</string>
-    <string name="qs_tile_label">"BeamDrop"</string>
+    <string name="app_name">"ZapDrop"</string>
+    <string name="main_activity_title">"ZapDrop"</string>
+    <string name="qs_tile_label">"ZapDrop"</string>
 </resources>

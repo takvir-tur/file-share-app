@@ -7,12 +7,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use beamdrop_core::transfer::{
-    DEFAULT_APPROVAL_TIMEOUT, MAX_PARALLEL_STREAMS, ResumeMetadata, TransferError, TransferEvent,
-    TransferProgress, hash_file_blake3, part_path_for, resume_path_for,
+    DEFAULT_APPROVAL_TIMEOUT, MAX_PARALLEL_STREAMS, ResumeMetadata, TransferDirection,
+    TransferError, TransferEvent, TransferProgress, hash_file_blake3, part_path_for,
+    resume_path_for,
 };
-use beamdrop_core::{BeamDropNode, NodeConfig, PeerEvent};
+use beamdrop_core::{BeamDropNode, DeviceIdentity, NodeConfig, OsType, PeerEvent, PeerInfo};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+use uuid::Uuid;
 
 static NEXT_DIR_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -946,7 +948,7 @@ async fn test_wan_opt_in_reconfigures_endpoint_and_encrypts_chunks() {
     let expected_hash = hash_file_blake3(&payload_path).await.unwrap();
 
     let alice = start_test_node(tmp.path(), "alice").await;
-    let bob = start_test_node(tmp.path(), "bob").await;
+    let bob = Arc::new(start_test_node(tmp.path(), "bob").await);
 
     // 1. Fresh nodes default to strictly LAN-only (no WAN relay/discovery active)
     assert!(!alice.trust_store().any_wan_enabled().await);
@@ -1003,7 +1005,7 @@ async fn test_wan_opt_in_reconfigures_endpoint_and_encrypts_chunks() {
         "unexpected error: {peer_rejected}"
     );
 
-    // 5. Enabling WAN on Bob completes end-to-end daily-rotating ChaCha20-Poly1305 encrypted transfer
+    // 5. Enabling WAN on Bob holds WAN offer in PendingApproval (auto_accept_wan defaults to false) until approved
     assert!(bob
         .set_peer_wan_enabled(alice.identity().node_id, true)
         .await
@@ -1011,31 +1013,46 @@ async fn test_wan_opt_in_reconfigures_endpoint_and_encrypts_chunks() {
     assert!(bob.discovery().is_wan_transport_enabled());
 
     let mut bob_events = bob.subscribe_transfers();
+    let bob_approve_task = {
+        let bob_ref = Arc::clone(&bob);
+        tokio::spawn(async move {
+            loop {
+                match bob_events.recv().await {
+                    Ok(TransferEvent::PendingApproval {
+                        transfer_id,
+                        is_wan,
+                        ..
+                    }) => {
+                        assert!(is_wan, "WAN offer must carry is_wan = true in PendingApproval");
+                        bob_ref.respond_to_offer(transfer_id, true).await.unwrap();
+                    }
+                    Ok(TransferEvent::Completed {
+                        transfer_id,
+                        verified,
+                        ..
+                    }) => {
+                        assert!(verified, "decrypted WAN file must pass BLAKE3 verification");
+                        return transfer_id;
+                    }
+                    Ok(_) => continue,
+                    Err(e) => panic!("bob event channel error: {e}"),
+                }
+            }
+        })
+    };
+
     let summary = alice
         .send_path_with_wan_override(bob.identity().node_id, &payload_path, Some(true), None)
         .await
-        .expect("WAN encrypted transfer succeeds once both peers opt in");
+        .expect("WAN encrypted transfer succeeds once both peers opt in and receiver approves");
     assert_eq!(summary.files_count, 1);
     assert_eq!(summary.total_bytes, total_bytes);
 
-    timeout(Duration::from_secs(10), async {
-        loop {
-            match bob_events.recv().await {
-                Ok(TransferEvent::Completed {
-                    transfer_id,
-                    verified,
-                    ..
-                }) if transfer_id == summary.transfer_id => {
-                    assert!(verified, "decrypted WAN file must pass BLAKE3 verification");
-                    break;
-                }
-                Ok(_) => continue,
-                Err(e) => panic!("bob event channel error: {e}"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for WAN transfer completion");
+    let completed_id = timeout(Duration::from_secs(10), bob_approve_task)
+        .await
+        .expect("timed out waiting for WAN transfer completion")
+        .unwrap();
+    assert_eq!(completed_id, summary.transfer_id);
 
     let received = bob.download_dir().join("wan_secret_payload.bin");
     let got_hash = hash_file_blake3(&received).await.unwrap();
@@ -1050,5 +1067,396 @@ async fn test_wan_opt_in_reconfigures_endpoint_and_encrypts_chunks() {
     assert!(!alice.discovery().is_wan_transport_enabled());
 
     alice.shutdown().await;
-    bob.shutdown().await;
+    Arc::try_unwrap(bob).ok().unwrap().shutdown().await;
+}
+
+#[tokio::test]
+async fn test_sender_awaiting_approval_and_timeout_failure() {
+    let tmp = TestTempDir::new("awaiting_timeout");
+    let payload_path = tmp.path().join("await_timeout_payload.bin");
+    create_deterministic_file(&payload_path, 64 * 1024, 0x1111_2222_3333_4444);
+
+    let alice = Arc::new(start_test_node(tmp.path(), "alice").await);
+    let bob = Arc::new(start_test_node(tmp.path(), "bob").await);
+    pair_nodes_localhost(&alice, &bob).await;
+
+    // Require explicit manual approval on Bob and use a fast 350ms timeout.
+    bob.trust_store()
+        .set_peer_auto_accept(&alice.identity().node_id, false, false)
+        .await
+        .unwrap();
+    bob.transfer()
+        .set_approval_timeout(Duration::from_millis(350))
+        .await;
+
+    let tid = Uuid::new_v4();
+    let mut alice_events = alice.subscribe_transfers();
+    let bob_id = bob.identity().node_id;
+
+    let err = timeout(
+        Duration::from_secs(10),
+        alice.send_path_for_id(tid, bob_id, &payload_path, None),
+    )
+    .await
+    .expect("timeout test hung")
+    .expect_err("unaccepted offer must fail after receiver approval timeout");
+    assert!(
+        err.to_string().contains("timed out"),
+        "expected timed out error, got: {err}"
+    );
+
+    let mut saw_started = false;
+    let mut saw_awaiting = false;
+    let mut saw_failed_same_id = false;
+    for _ in 0..32 {
+        let Ok(Ok(ev)) = timeout(Duration::from_millis(200), alice_events.recv()).await else {
+            break;
+        };
+        match ev {
+            TransferEvent::Started { transfer_id, .. } if transfer_id == tid => {
+                saw_started = true;
+            }
+            TransferEvent::AwaitingApproval {
+                transfer_id,
+                expires_at_unix_ms,
+                ..
+            } if transfer_id == tid => {
+                assert!(expires_at_unix_ms > 0);
+                saw_awaiting = true;
+            }
+            TransferEvent::Failed {
+                transfer_id,
+                direction,
+                reason,
+                ..
+            } if transfer_id == tid => {
+                assert_eq!(direction, TransferDirection::Outgoing);
+                assert!(
+                    reason.contains("did not receive the transfer (timed out)"),
+                    "unexpected failure reason: {reason}"
+                );
+                saw_failed_same_id = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_started, "expected Started event for pre-allocated transfer_id");
+    assert!(saw_awaiting, "expected AwaitingApproval event before timeout");
+    assert!(saw_failed_same_id, "expected Failed event reusing the same transfer_id");
+
+    Arc::try_unwrap(alice).ok().unwrap().shutdown().await;
+    Arc::try_unwrap(bob).ok().unwrap().shutdown().await;
+}
+
+#[tokio::test]
+async fn test_cancel_during_connecting_and_awaiting_approval() {
+    let tmp = TestTempDir::new("cancel_states");
+    let payload_path = tmp.path().join("cancel_payload.bin");
+    create_deterministic_file(&payload_path, 32 * 1024, 0x9999_8888_7777_6666);
+
+    let alice = Arc::new(start_test_node(tmp.path(), "alice").await);
+    let bob = Arc::new(start_test_node(tmp.path(), "bob").await);
+    pair_nodes_localhost(&alice, &bob).await;
+
+    // 1. Cancel while still dialing in Connecting state via a silent local UDP blackhole
+    let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind blackhole UDP");
+    let blackhole_addr = blackhole.local_addr().unwrap();
+    let phantom_id = DeviceIdentity::generate().node_id;
+    {
+        let table_arc = alice.discovery().peer_table();
+        let mut table = table_arc.write().await;
+        table
+            .upsert(
+                PeerInfo {
+                    node_id: phantom_id,
+                    display_name: "BlackholePeer".to_string(),
+                    os_type: OsType::MacOS,
+                    addr: Some(blackhole_addr),
+                    port: blackhole_addr.port(),
+                    is_lan: true,
+                    online: true,
+                    last_seen_unix_ms: 1_700_000_000_000,
+                },
+                None,
+            )
+            .unwrap();
+    }
+
+    let tid_connect = Uuid::new_v4();
+    let mut alice_events = alice.subscribe_transfers();
+    let connect_handle = {
+        let a = Arc::clone(&alice);
+        let p = payload_path.clone();
+        tokio::spawn(async move { a.send_path_for_id(tid_connect, phantom_id, &p, None).await })
+    };
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match alice_events.recv().await {
+                Ok(TransferEvent::Started { transfer_id, .. }) if transfer_id == tid_connect => {
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("alice event error: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for Connecting Started event");
+
+    assert!(
+        alice.cancel_transfer(tid_connect).await,
+        "cancel_transfer during Connecting must return true"
+    );
+
+    let connect_res = timeout(Duration::from_secs(3), connect_handle)
+        .await
+        .expect("Connecting task did not abort promptly on cancel")
+        .unwrap()
+        .expect_err("Cancelled dial must return Err");
+    assert!(
+        matches!(
+            connect_res.downcast_ref::<TransferError>(),
+            Some(TransferError::Cancelled(id)) if *id == tid_connect
+        ),
+        "expected Cancelled({tid_connect}), got: {connect_res}"
+    );
+    drop(blackhole);
+
+    // 2. Cancel while held in AwaitingApproval on sender (and PendingApproval on receiver)
+    bob.trust_store()
+        .set_peer_auto_accept(&alice.identity().node_id, false, false)
+        .await
+        .unwrap();
+    bob.transfer()
+        .set_approval_timeout(Duration::from_secs(10))
+        .await;
+
+    let tid_wait = Uuid::new_v4();
+    let mut bob_events = bob.subscribe_transfers();
+    let wait_handle = {
+        let a = Arc::clone(&alice);
+        let bob_id = bob.identity().node_id;
+        let p = payload_path.clone();
+        tokio::spawn(async move { a.send_path_for_id(tid_wait, bob_id, &p, None).await })
+    };
+
+    timeout(Duration::from_secs(5), async {
+        let mut alice_waiting = false;
+        let mut bob_pending = false;
+        while !alice_waiting || !bob_pending {
+            tokio::select! {
+                ev = alice_events.recv() => {
+                    if let Ok(TransferEvent::AwaitingApproval { transfer_id, .. }) = ev {
+                        if transfer_id == tid_wait {
+                            alice_waiting = true;
+                        }
+                    }
+                }
+                ev = bob_events.recv() => {
+                    if let Ok(TransferEvent::PendingApproval { transfer_id, .. }) = ev {
+                        if transfer_id == tid_wait {
+                            bob_pending = true;
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for AwaitingApproval / PendingApproval");
+
+    assert!(
+        alice.cancel_transfer(tid_wait).await,
+        "cancel_transfer during AwaitingApproval must return true"
+    );
+
+    let wait_res = timeout(Duration::from_secs(3), wait_handle)
+        .await
+        .expect("AwaitingApproval did not abort promptly on cancel")
+        .unwrap()
+        .expect_err("Cancelled AwaitingApproval must return Err");
+    assert!(
+        matches!(
+            wait_res.downcast_ref::<TransferError>(),
+            Some(TransferError::Cancelled(id)) if *id == tid_wait
+        ),
+        "expected Cancelled({tid_wait}), got: {wait_res}"
+    );
+
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if !bob.transfer().pending_offer_ids().await.contains(&tid_wait) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("receiver did not dismiss PendingApproval when sender cancelled");
+
+    Arc::try_unwrap(alice).ok().unwrap().shutdown().await;
+    Arc::try_unwrap(bob).ok().unwrap().shutdown().await;
+}
+
+#[tokio::test]
+async fn test_wan_512kib_encrypted_transfer_and_wifi_drop_recovery() {
+    let tmp = TestTempDir::new("wan_512kib_wifi_drop");
+    let src_file = tmp.path().join("wan_3mb.bin");
+    create_deterministic_file(&src_file, 3 * 1024 * 1024 + 777, 0x5120_C40C);
+    let src_hash = hash_file_blake3(&src_file).await.expect("hash source file");
+
+    let alice = Arc::new(start_test_node(tmp.path(), "alice_wan").await);
+    let bob = Arc::new(start_test_node(tmp.path(), "bob_wan").await);
+    pair_nodes_localhost(&alice, &bob).await;
+
+    // 1. Enable WAN + auto-accept WAN so 512 KiB encrypted transfer streams without blocking.
+    assert!(alice
+        .set_peer_wan_enabled(bob.identity().node_id, true)
+        .await
+        .unwrap());
+    assert!(bob
+        .set_peer_wan_enabled(alice.identity().node_id, true)
+        .await
+        .unwrap());
+    bob.trust_store()
+        .set_peer_auto_accept(&alice.identity().node_id, true, true)
+        .await
+        .unwrap();
+
+    let (progress_tx, mut progress_rx) = mpsc::channel::<TransferProgress>(128);
+    let _summary = timeout(
+        Duration::from_secs(30),
+        alice.send_path_with_wan_override(
+            bob.identity().node_id,
+            &src_file,
+            Some(true),
+            Some(progress_tx),
+        ),
+    )
+    .await
+    .expect("WAN 512 KiB transfer timed out")
+    .expect("WAN 512 KiB transfer failed");
+
+    let mut saw_wan_progress = false;
+    while let Ok(p) = progress_rx.try_recv() {
+        if p.is_wan {
+            saw_wan_progress = true;
+        }
+    }
+    assert!(saw_wan_progress, "expected WAN TransferProgress telemetry");
+
+    let dst_file = bob.download_dir().join("wan_3mb.bin");
+    assert_eq!(hash_file_blake3(&dst_file).await.unwrap(), src_hash);
+    assert!(!resume_path_for(&dst_file).exists());
+
+    // 2. Simulate LAN Wi-Fi disconnect with WAN disabled: verify Pause reason + offline recovery.
+    alice
+        .set_peer_wan_enabled(bob.identity().node_id, false)
+        .await
+        .unwrap();
+    bob.set_peer_wan_enabled(alice.identity().node_id, false)
+        .await
+        .unwrap();
+
+    let drop_src = tmp.path().join("wifi_drop_24mb.bin");
+    create_deterministic_file(&drop_src, 24 * 1024 * 1024, 0xD409_BEEF);
+    let drop_hash = hash_file_blake3(&drop_src).await.expect("hash drop_src");
+
+    let mut alice_events = alice.subscribe_transfers();
+    let (drop_tx, mut drop_rx) = mpsc::channel::<TransferProgress>(128);
+    let tid = Uuid::new_v4();
+    let bob_id = bob.identity().node_id;
+    let send_task = tokio::spawn({
+        let a = Arc::clone(&alice);
+        let p = drop_src.clone();
+        async move { a.send_path_for_id(tid, bob_id, &p, Some(drop_tx)).await }
+    });
+
+    timeout(Duration::from_secs(10), async {
+        while let Some(p) = drop_rx.recv().await {
+            if p.bytes_transferred >= 256 * 1024 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for initial LAN bytes");
+
+    Arc::try_unwrap(bob)
+        .ok()
+        .expect("no lingering bob Arc clones")
+        .shutdown()
+        .await;
+
+    let send_err = timeout(Duration::from_secs(10), send_task)
+        .await
+        .expect("sender did not finish after disconnect")
+        .unwrap()
+        .expect_err("mid-transfer disconnect must transition to Paused");
+    assert!(
+        matches!(
+            send_err.downcast_ref::<TransferError>(),
+            Some(TransferError::Paused(id)) if *id == tid
+        ),
+        "expected Paused({tid}), got {send_err}"
+    );
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match alice_events.recv().await {
+                Ok(TransferEvent::Paused {
+                    transfer_id,
+                    reason,
+                }) if transfer_id == tid => {
+                    assert_eq!(
+                        reason.as_deref(),
+                        Some("Wi-Fi disconnected — tap Resume when back online")
+                    );
+                    break;
+                }
+                Ok(TransferEvent::Failed { transfer_id, .. }) if transfer_id == tid => {
+                    panic!("Wi-Fi disconnect must not emit Failed");
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("alice event channel failed: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for sender Wi-Fi disconnect Paused event");
+
+    // 3. Receiver comes back online on LAN and sender resumes cleanly from verified chunks.
+    let bob_restarted = Arc::new(start_test_node(tmp.path(), "bob_wan").await);
+    connect_localhost(&alice, &bob_restarted).await;
+    let mut bob_events = bob_restarted.subscribe_transfers();
+
+    alice.resume_transfer(tid).await.expect("resume_transfer");
+
+    timeout(Duration::from_secs(30), async {
+        loop {
+            match bob_events.recv().await {
+                Ok(TransferEvent::Completed {
+                    transfer_id,
+                    verified,
+                    ..
+                }) if transfer_id == tid => {
+                    assert!(verified);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("bob restarted event error: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for resumed completion");
+
+    let final_drop = bob_restarted.download_dir().join("wifi_drop_24mb.bin");
+    assert_eq!(hash_file_blake3(&final_drop).await.unwrap(), drop_hash);
+
+    Arc::try_unwrap(alice).ok().unwrap().shutdown().await;
+    Arc::try_unwrap(bob_restarted).ok().unwrap().shutdown().await;
 }

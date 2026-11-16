@@ -30,7 +30,11 @@ pub fn show_main_window(app: &AppHandle<Wry>) {
 /// Constructs the dynamic tray menu reflecting currently online/paired devices and autostart state.
 pub async fn build_tray_menu(app: &AppHandle<Wry>) -> tauri::Result<Menu<Wry>> {
     let state = app.state::<AppState>();
-    let peers = collect_peer_entries(&state.node).await;
+    let peers = if let Some(node) = state.node.read().await.as_ref().cloned() {
+        collect_peer_entries(&node).await
+    } else {
+        Vec::new()
+    };
 
     let mut send_submenu = SubmenuBuilder::new(app, "Send File to");
     let available: Vec<_> = peers
@@ -65,7 +69,7 @@ pub async fn build_tray_menu(app: &AppHandle<Wry>) -> tauri::Result<Menu<Wry>> {
     let send_menu = send_submenu.build()?;
     let autostart_enabled = app.autolaunch().is_enabled().unwrap_or(false);
 
-    let open_item = MenuItem::with_id(app, MENU_OPEN_APP, "Open BeamDrop", true, None::<&str>)?;
+    let open_item = MenuItem::with_id(app, MENU_OPEN_APP, "Open ZapDrop", true, None::<&str>)?;
     let downloads_item = MenuItem::with_id(
         app,
         MENU_OPEN_DOWNLOADS,
@@ -110,7 +114,7 @@ pub fn setup_tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
     let initial_menu = tauri::async_runtime::block_on(build_tray_menu(app))?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
-        .tooltip("BeamDrop — P2P LAN File Drop")
+        .tooltip("ZapDrop — Fast File Drop")
         .menu(&initial_menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| {
@@ -147,12 +151,17 @@ fn handle_menu_event(app: &AppHandle<Wry>, id: &str) {
             show_main_window(app);
         }
         MENU_OPEN_DOWNLOADS => {
-            let state = app.state::<AppState>();
-            let dir = state.node.download_dir().to_path_buf();
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = app
-                .opener()
-                .open_path(dir.to_string_lossy().into_owned(), None::<&str>);
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app_handle.state::<AppState>();
+                if let Ok(node) = state.require_node().await {
+                    let dir = node.download_dir().to_path_buf();
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = app_handle
+                        .opener()
+                        .open_path(dir.to_string_lossy().into_owned(), None::<&str>);
+                }
+            });
         }
         MENU_AUTOSTART => {
             let manager = app.autolaunch();
@@ -180,8 +189,10 @@ fn handle_menu_event(app: &AppHandle<Wry>, id: &str) {
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app_handle.state::<AppState>();
-                    let peer_label = state
-                        .node
+                    let Ok(node) = state.require_node().await else {
+                        return;
+                    };
+                    let peer_label = node
                         .discovery()
                         .known_peers()
                         .await
@@ -210,6 +221,7 @@ fn handle_menu_event(app: &AppHandle<Wry>, id: &str) {
                             dispatch_send_paths(
                                 &picker_app,
                                 &dispatch_state,
+                                &node,
                                 peer_node_id,
                                 peer_label,
                                 paths,

@@ -3,22 +3,13 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
-import { ApprovalModal } from "./components/ApprovalModal";
+import zapdropLogo from "./assets/zapdrop-icon.png";
 import { CellularConfirmModal, PendingCellularSend } from "./components/CellularConfirmModal";
+import { DeviceGrid } from "./components/DeviceGrid";
+import { IncomingTransferBanner } from "./components/IncomingTransferBanner";
 import { PairDeviceModal } from "./components/PairDeviceModal";
-import { RadarView } from "./components/RadarView";
-import { SavedContacts } from "./components/SavedContacts";
 import { TransferDrawer } from "./components/TransferDrawer";
-import {
-  CloseIcon,
-  FolderIcon,
-  OsIcon,
-  QrIcon,
-  RadarIcon,
-  RefreshIcon,
-  SendIcon,
-  WarningIcon,
-} from "./icons";
+import { CloseIcon, FolderIcon, OsIcon, QrIcon, SendIcon, WarningIcon } from "./icons";
 import {
   FirewallStatus,
   MeasurePathsResult,
@@ -33,41 +24,19 @@ import {
   TransferRecord,
   TrustedPeer,
 } from "./types";
-
-function hitTestDropTarget(
-  xPhys: number,
-  yPhys: number,
-  selectedPeerId: string | null,
-  peers: PeerEntry[]
-) {
-  const dpr = window.devicePixelRatio || 1;
-  const els = document.elementsFromPoint(xPhys / dpr, yPhys / dpr);
-
-  for (const el of els) {
-    if (el instanceof HTMLElement) {
-      const id = el.closest<HTMLElement>("[data-peer-node-id]")?.dataset.peerNodeId;
-      if (id) return { hoveredPeerId: id, onRadarSurface: true };
-    }
-  }
-  const onRadar = els.some((el) => el instanceof HTMLElement && el.closest("[data-radar-drop-surface='true']"));
-  if (onRadar && selectedPeerId && peers.some((p) => p.nodeId === selectedPeerId)) {
-    return { hoveredPeerId: selectedPeerId, onRadarSurface: true };
-  }
-  return { hoveredPeerId: null, onRadarSurface: onRadar };
-}
+import { hitTestDropTarget, isPeerSendable } from "./utils/dropHitTest";
 
 export default function App() {
   const inTauri = isTauri();
   const [selfInfo, setSelfInfo] = useState<SelfInfo | null>(null);
   const [peers, setPeers] = useState<PeerEntry[]>([]);
-  const [selectedPeerId, setSelectedPeerId] = useState<string | null>(null);
   const [hoveredDropPeerId, setHoveredDropPeerId] = useState<string | null>(null);
-  const [isDraggingOnRadar, setIsDraggingOnRadar] = useState(false);
 
   const [history, setHistory] = useState<TransferRecord[]>([]);
   const [drawerExpanded, setDrawerExpanded] = useState(false);
 
   const [pairModalOpen, setPairModalOpen] = useState(false);
+  const [pairInitialTarget, setPairInitialTarget] = useState<string | null>(null);
   const [pairingSession, setPairingSession] = useState<PairingSession | null>(null);
   const [pairError, setPairError] = useState<string | null>(null);
 
@@ -78,28 +47,20 @@ export default function App() {
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const lanPeers = peers.filter((p) => p.online);
+  const visiblePeers = peers.filter((p) => p.paired || p.online);
+  const sendablePeers = visiblePeers.filter(isPeerSendable);
   const isAndroid = Boolean(selfInfo?.osType.toLowerCase().includes("android"));
 
   const peersRef = useRef<PeerEntry[]>([]);
-  const lanPeersRef = useRef<PeerEntry[]>([]);
-  const selectedRef = useRef<string | null>(null);
+  const sendablePeersRef = useRef<PeerEntry[]>([]);
   const inFlightPairingRef = useRef<Set<string>>(new Set());
   peersRef.current = peers;
-  lanPeersRef.current = lanPeers;
-  selectedRef.current = selectedPeerId;
+  sendablePeersRef.current = sendablePeers;
 
   const showError = useCallback((msg: string) => {
     setErrorBanner(msg);
     setToast(msg);
   }, []);
-
-  const pickDefault = (list: PeerEntry[], curr: string | null) => {
-    const online = list.filter((p) => p.online);
-    return curr && online.some((p) => p.nodeId === curr)
-      ? curr
-      : online[0]?.nodeId ?? null;
-  };
 
   const queuePaths = (paths: string[]) =>
     setQueuedSendPaths((p) => Array.from(new Set([...p, ...paths])));
@@ -109,17 +70,17 @@ export default function App() {
 
   const syncPeers = useCallback((list: PeerEntry[]) => {
     setPeers(list);
-    setSelectedPeerId((curr) => pickDefault(list, curr));
   }, []);
 
   const applyTargetedSend = useCallback((req: TargetedSendRequest, peerList?: PeerEntry[]) => {
     if (!req.paths.length) return;
     const pool = peerList ?? peersRef.current;
     const matched = pool.find((p) => p.nodeId === req.targetNodeId);
-    setSelectedPeerId(req.targetNodeId);
     setDrawerExpanded(true);
     setErrorBanner(null);
-    setToast(`Sending ${req.paths.length} item(s) to ${matched?.displayName ?? req.targetNodeId.slice(0, 10)}`);
+    setToast(
+      `Sending ${req.paths.length} item(s) to ${matched?.displayName ?? req.targetNodeId.slice(0, 10)}`
+    );
   }, []);
 
   const handleIncomingPairingUri = useCallback(
@@ -135,13 +96,12 @@ export default function App() {
           pin: parsed.pin,
         });
         syncPeers(await invoke<PeerEntry[]>("list_peers"));
-        setSelectedPeerId(paired.nodeId);
         setPairModalOpen(false);
         setPairError(null);
         setErrorBanner(null);
         setToast(`Paired with ${paired.friendlyAlias}`);
       } catch (err) {
-        showError(`QR pairing failed: ${String(err)}`);
+        showError(`Pairing failed: ${String(err)}`);
       } finally {
         inFlightPairingRef.current.delete(trimmed);
         setBusy(false);
@@ -213,49 +173,47 @@ export default function App() {
     [showError]
   );
 
-  const performSend = useCallback(
-    async (peer: PeerEntry, paths: string[], fromQueue: boolean) => {
-      const res = await invoke<SendDispatchResult>("send_paths", {
-        targetNodeId: peer.nodeId,
-        paths,
-      });
-      if (fromQueue) setQueuedSendPaths([]);
-      setErrorBanner(null);
-      setDrawerExpanded(true);
-      setToast(
-        `Sending ${res.queued} item(s) to ${peer.displayName}${peer.online ? "" : " via Long-Distance"}`
-      );
-    },
-    []
-  );
+  const performSend = useCallback(async (peer: PeerEntry, paths: string[], fromQueue: boolean) => {
+    const res = await invoke<SendDispatchResult>("send_paths", {
+      targetNodeId: peer.nodeId,
+      paths,
+    });
+    if (fromQueue) setQueuedSendPaths([]);
+    setErrorBanner(null);
+    setDrawerExpanded(true);
+    setToast(`Sending ${res.queued} item(s) to ${peer.displayName}`);
+  }, []);
 
   const dispatchPathsToPeer = useCallback(
     async (peer: PeerEntry, paths: string[], fromQueue = false) => {
       if (!inTauri || !paths.length) return;
-      if (!peer.online) {
+      if (!peer.online && !peer.addr) {
         if (!peer.allowWan) {
           showError(
-            `${peer.displayName} is offline on LAN. Enable Long-Distance in Saved Contacts to send over the internet.`
+            `${peer.displayName} is offline. Enable Internet Sharing in Sharing Settings to send over the internet.`
           );
           return;
         }
-        await runAction(async () => {
-          const [metered, measured] = await Promise.all([
-            invoke<boolean>("is_on_metered_cellular"),
-            invoke<MeasurePathsResult>("measure_paths_bytes", { paths }),
-          ]);
-          const resolved = measured.resolvedPaths.length ? measured.resolvedPaths : paths;
-          if (metered) {
-            setPendingCellularSend({
-              peer,
-              paths: resolved,
-              totalBytes: measured.totalBytes,
-              fromQueue,
-            });
-            return;
-          }
-          await performSend(peer, resolved, fromQueue);
-        }, (err) => showError(`Send failed: ${err}`));
+        await runAction(
+          async () => {
+            const [metered, measured] = await Promise.all([
+              invoke<boolean>("is_on_metered_cellular"),
+              invoke<MeasurePathsResult>("measure_paths_bytes", { paths }),
+            ]);
+            const resolved = measured.resolvedPaths.length ? measured.resolvedPaths : paths;
+            if (metered) {
+              setPendingCellularSend({
+                peer,
+                paths: resolved,
+                totalBytes: measured.totalBytes,
+                fromQueue,
+              });
+              return;
+            }
+            await performSend(peer, resolved, fromQueue);
+          },
+          (err) => showError(`Send failed: ${err}`)
+        );
         return;
       }
       await runAction(
@@ -271,7 +229,7 @@ export default function App() {
 
   useEffect(() => {
     if (!inTauri) return;
-    void refreshState().catch((err: unknown) => showError(`Daemon error: ${String(err)}`));
+    void refreshState().catch((err: unknown) => showError(`Startup error: ${String(err)}`));
 
     const onVisibility = () => {
       if (!document.hidden) void resyncOnForeground();
@@ -292,9 +250,15 @@ export default function App() {
           )
         );
         if (
-          ["auto_accepted", "progress", "offer_received", "started", "paused"].includes(
-            payload.kind
-          )
+          [
+            "auto_accepted",
+            "awaiting_approval",
+            "progress",
+            "offer_received",
+            "started",
+            "paused",
+            "failed",
+          ].includes(payload.kind)
         ) {
           setDrawerExpanded(true);
         }
@@ -309,8 +273,11 @@ export default function App() {
       listen<string[]>("beamdrop://send-paths", ({ payload }) => {
         if (payload.length) {
           queuePaths(payload);
-          setToast(`Ready to send ${payload.length} queued item(s). Click a device.`);
+          setToast(`Ready to send ${payload.length} item(s) — choose a device.`);
         }
+        void invoke<string[]>("take_pending_send_paths").then((drained) => {
+          if (drained.length) queuePaths(drained);
+        });
       }),
       listen<TargetedSendRequest>("beamdrop://targeted-send", ({ payload }) => {
         applyTargetedSend(payload);
@@ -321,28 +288,23 @@ export default function App() {
       getCurrentWebview().onDragDropEvent(({ payload }) => {
         if (payload.type === "leave") {
           setHoveredDropPeerId(null);
-          setIsDraggingOnRadar(false);
           return;
         }
-        const hit = hitTestDropTarget(
+        const hitPeerId = hitTestDropTarget(
           payload.position.x,
           payload.position.y,
-          selectedRef.current,
-          lanPeersRef.current
+          sendablePeersRef.current
         );
         if (payload.type === "enter" || payload.type === "over") {
-          setHoveredDropPeerId(hit.hoveredPeerId);
-          setIsDraggingOnRadar(hit.onRadarSurface);
+          setHoveredDropPeerId(hitPeerId);
         } else if (payload.type === "drop") {
           setHoveredDropPeerId(null);
-          setIsDraggingOnRadar(false);
-          const target = lanPeersRef.current.find((p) => p.nodeId === hit.hoveredPeerId);
+          const target = sendablePeersRef.current.find((p) => p.nodeId === hitPeerId);
           if (target && payload.paths.length) {
-            setSelectedPeerId(target.nodeId);
             void dispatchRef.current(target, payload.paths, false);
           } else if (payload.paths.length) {
             queuePaths(payload.paths);
-            setToast("Drop missed device — queued. Click a node to send.");
+            setToast("Files ready — choose a device below to send.");
           }
         }
       }),
@@ -362,13 +324,31 @@ export default function App() {
     syncPeers,
   ]);
 
-  const refreshPairing = useCallback(() => {
+  const ensurePairing = useCallback(() => {
     if (!inTauri) return;
     void runAction(async () => {
-      setPairingSession(await invoke<PairingSession>("start_pairing"));
+      setPairingSession(await invoke<PairingSession>("start_pairing", { forceNew: false }));
       setPairError(null);
     }, setPairError);
   }, [inTauri, runAction]);
+
+  const regeneratePairing = useCallback(() => {
+    if (!inTauri) return;
+    void runAction(async () => {
+      setPairingSession(await invoke<PairingSession>("regenerate_pairing"));
+      setPairError(null);
+    }, setPairError);
+  }, [inTauri, runAction]);
+
+  const openPairModal = useCallback(
+    (targetNodeId?: string) => {
+      setPairError(null);
+      setPairInitialTarget(targetNodeId ?? null);
+      setPairModalOpen(true);
+      ensurePairing();
+    },
+    [ensurePairing]
+  );
 
   const handlePeerClick = async (peer: PeerEntry, directory = false) => {
     if (!inTauri) return;
@@ -412,9 +392,20 @@ export default function App() {
       syncPeers(await invoke<PeerEntry[]>("list_peers"));
       setToast(
         enabled
-          ? `Long-Distance enabled for ${peer.displayName}`
-          : `Long-Distance disabled for ${peer.displayName}`
+          ? `Internet Sharing enabled for ${peer.displayName}`
+          : `Internet Sharing disabled for ${peer.displayName}`
       );
+    });
+
+  const handleToggleAutoAccept = (peer: PeerEntry, lanAuto: boolean, wanAuto: boolean) =>
+    runAction(async () => {
+      await invoke<boolean>("set_peer_auto_accept", {
+        nodeId: peer.nodeId,
+        lanAuto,
+        wanAuto,
+      });
+      syncPeers(await invoke<PeerEntry[]>("list_peers"));
+      setToast(`Updated sharing settings for ${peer.displayName}`);
     });
 
   const confirmCellularSend = () => {
@@ -427,53 +418,68 @@ export default function App() {
     );
   };
 
+  const handleRemoveTrusted = (
+    nodeId: string,
+    label?: string,
+    onErr: (msg: string) => void = (err) => showError(`Remove failed: ${err}`)
+  ) =>
+    runAction(async () => {
+      await invoke<boolean>("remove_trusted_peer", { nodeId });
+      syncPeers(await invoke<PeerEntry[]>("list_peers"));
+      setToast(label ? `Removed ${label}` : "Removed device");
+    }, onErr);
+
   const pendingOffer = history.find((item) => item.status === "pending_approval") ?? null;
 
   return (
     <div className="app">
-      <header className="card hdr sb">
+      <IncomingTransferBanner
+        offer={pairModalOpen || pendingCellularSend ? null : pendingOffer}
+        busy={busy}
+        variant="inline"
+        onRespond={(transferId, accept) =>
+          runAction(async () => {
+            await invoke("respond_to_offer", { transferId, accept });
+            setHistory(await invoke<TransferRecord[]>("get_transfer_history"));
+            if (accept) setDrawerExpanded(true);
+          })
+        }
+      />
+
+      <header className="card hdr">
         <div className="idbox">
-          <div className="brand" aria-hidden="true"><RadarIcon size={20} /></div>
+          <img src={zapdropLogo} alt="" width={34} height={34} className="brand-ico" />
           <div className="idtxt">
-            <div className="row">
-              <h1>{selfInfo?.hostname ?? "BeamDrop"}</h1>
-              <span className="badge b-ac">
-                <OsIcon osType={selfInfo?.osType ?? "macOS"} size={13} />
-                <span>{selfInfo?.osType ?? "Desktop"}</span>
-              </span>
-              {selfInfo && <span className="badge mono mu">{selfInfo.lanIp}:{selfInfo.listenPort}</span>}
+            <div className="row g8">
+              <h1>ZapDrop</h1>
+              {selfInfo && (
+                <span className="badge">
+                  <OsIcon osType={selfInfo.osType} size={13} />
+                  <span>{selfInfo.hostname}</span>
+                </span>
+              )}
+              {selfInfo && (
+                <span className="mono mu xs">
+                  {selfInfo.lanIp}:{selfInfo.listenPort}
+                </span>
+              )}
             </div>
-            <p className="subline">{toast ?? "Zero-copy QUIC + mDNS LAN sharing"}</p>
+            {toast && (
+              <p className="subline" role="status">
+                {toast}
+              </p>
+            )}
           </div>
         </div>
 
-        <div className="row">
-          <button
-            type="button"
-            className="btn bs"
-            disabled={!inTauri}
-            title="Probe cached devices on LAN"
-            onClick={() => void resyncOnForeground()}
-          >
-            <RefreshIcon size={15} />
-            <span>Scan</span>
-          </button>
-          <button
-            type="button"
-            className="btn bp"
-            onClick={() => { setPairError(null); setPairModalOpen(true); refreshPairing(); }}
-          >
+        <div className="hdr-act">
+          <button type="button" className="btn bp" onClick={() => openPairModal()}>
             <QrIcon size={16} />
             <span>Pair Device</span>
           </button>
-          <button
-            type="button"
-            className="btn bs"
-            disabled={!inTauri}
-            onClick={openDownloads}
-          >
+          <button type="button" className="btn bs" disabled={!inTauri} onClick={openDownloads}>
             <FolderIcon size={16} />
-            <span>Open Downloads</span>
+            <span>Downloads</span>
           </button>
         </div>
       </header>
@@ -502,8 +508,8 @@ export default function App() {
         <div className="banner al-wn sb" role="alert">
           <div className="al-in">
             <WarningIcon size={18} />
-            <div>
-              <strong>Windows Defender Firewall is blocking LAN discovery</strong>
+            <div className="min0">
+              <strong>Windows Firewall is blocking local discovery</strong>
               <div className="mu xs">{firewall.details}</div>
             </div>
           </div>
@@ -519,7 +525,7 @@ export default function App() {
               })
             }
           >
-            Fix Firewall
+            Allow ZapDrop
           </button>
         </div>
       )}
@@ -528,36 +534,34 @@ export default function App() {
         <div className="banner al-ac sb" role="status">
           <div className="al-in">
             <SendIcon size={17} />
-            <div>
-              <strong>Ready to Send ({queuedSendPaths.length} {queuedSendPaths.length === 1 ? "item" : "items"})</strong>
-              <div className="mu mono">Click a radar device or Saved Contact below to start sending immediately.</div>
+            <div className="min0">
+              <strong>
+                Ready to Send ({queuedSendPaths.length} {queuedSendPaths.length === 1 ? "item" : "items"})
+              </strong>
+              <div className="mu xs">Click a device below to send now.</div>
             </div>
           </div>
-          <button type="button" className="btn bs sm" onClick={() => setQueuedSendPaths([])}>Clear</button>
+          <button type="button" className="btn bs sm" onClick={() => setQueuedSendPaths([])}>
+            Clear
+          </button>
         </div>
       )}
 
-      <main className="main stack">
-        <RadarView
-          selfInfo={selfInfo}
-          peers={lanPeers}
-          selectedPeerId={selectedPeerId}
+      <main className="main">
+        <DeviceGrid
+          peers={visiblePeers}
+          busy={busy}
           hoveredDropPeerId={hoveredDropPeerId}
-          isDraggingOnRadar={isDraggingOnRadar}
-          queuedSendCount={queuedSendPaths.length}
-          busy={busy}
-          onSelectPeer={setSelectedPeerId}
-          onPeerClick={(peer) => void handlePeerClick(peer, false)}
-          onPickFolder={(peer) => void handlePeerClick(peer, true)}
-        />
-        <SavedContacts
-          peers={peers}
-          busy={busy}
           queuedSendCount={queuedSendPaths.length}
           isAndroid={isAndroid}
-          onToggleWan={handleToggleWan}
           onSendFiles={(peer) => void handlePeerClick(peer, false)}
           onSendFolder={(peer) => void handlePeerClick(peer, true)}
+          onOpenPair={openPairModal}
+          onToggleWan={handleToggleWan}
+          onToggleAutoAccept={handleToggleAutoAccept}
+          onRemoveTrusted={(peer) => {
+            void handleRemoveTrusted(peer.nodeId, peer.displayName);
+          }}
         />
       </main>
 
@@ -575,39 +579,24 @@ export default function App() {
         open={pairModalOpen}
         session={pairingSession}
         peers={peers}
+        initialTarget={pairInitialTarget}
         busy={busy}
         errorMessage={pairError}
-        onClose={() => setPairModalOpen(false)}
-        onRefreshSession={refreshPairing}
+        onClose={() => {
+          setPairModalOpen(false);
+        }}
+        onEnsureSession={ensurePairing}
+        onRegenerateSession={regeneratePairing}
         onPairSubmit={(target, pin) =>
           runAction(async () => {
             setPairError(null);
             const paired = await invoke<TrustedPeer>("pair_with_peer", { target, pin });
             syncPeers(await invoke<PeerEntry[]>("list_peers"));
-            setSelectedPeerId(paired.nodeId);
             setErrorBanner(null);
             setToast(`Paired with ${paired.friendlyAlias}`);
           }, setPairError)
         }
-        onRemoveTrusted={(nodeId) =>
-          runAction(async () => {
-            await invoke<boolean>("remove_trusted_peer", { nodeId });
-            syncPeers(await invoke<PeerEntry[]>("list_peers"));
-            setToast("Removed trusted device");
-          }, setPairError)
-        }
-      />
-
-      <ApprovalModal
-        offer={pendingOffer}
-        busy={busy}
-        onRespond={(transferId, accept) =>
-          runAction(async () => {
-            await invoke("respond_to_offer", { transferId, accept });
-            setHistory(await invoke<TransferRecord[]>("get_transfer_history"));
-            if (accept) setDrawerExpanded(true);
-          })
-        }
+        onRemoveTrusted={(nodeId) => handleRemoveTrusted(nodeId, undefined, setPairError)}
       />
 
       <CellularConfirmModal

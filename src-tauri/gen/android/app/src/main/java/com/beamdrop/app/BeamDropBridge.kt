@@ -1,11 +1,23 @@
 package com.beamdrop.app
 
+import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
+import android.media.AudioAttributes
+import android.media.RingtoneManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
@@ -14,6 +26,15 @@ import java.util.concurrent.ConcurrentLinkedQueue
 object BeamDropBridge {
     const val SHARE_CACHE_SUBDIR = "beamdrop_share"
     private const val COPY_BUFFER_BYTES = 131_072 // 128 KiB streaming copy
+    private const val INCOMING_CHANNEL_ID = "zapdrop_incoming_transfers"
+    private const val LEGACY_INCOMING_CHANNEL_ID = "beamdrop_incoming_transfer_high"
+    private const val INCOMING_NOTIFICATION_ID = 4109
+    private const val REQUEST_CODE_ACCEPT = 4110
+    private const val REQUEST_CODE_DECLINE = 4111
+    const val ACTION_ACCEPT_TRANSFER = "com.beamdrop.app.ACTION_ACCEPT_INCOMING_TRANSFER"
+    const val ACTION_DECLINE_TRANSFER = "com.beamdrop.app.ACTION_DECLINE_INCOMING_TRANSFER"
+    const val EXTRA_TRANSFER_ID = "extra_transfer_id"
+    const val EXTRA_ACCEPT_TRANSFER = "extra_accept_transfer"
 
     private data class TargetedShareBatch(
         val targetNodeId: String,
@@ -296,13 +317,137 @@ object BeamDropBridge {
     }
 
     @JvmStatic
+    fun showIncomingTransferNotification(
+        context: Context,
+        transferId: String,
+        title: String,
+        body: String
+    ) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                return
+            }
+        }
+
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                manager.deleteNotificationChannel(LEGACY_INCOMING_CHANNEL_ID)
+            } catch (_: Exception) {
+                // Ignore if legacy channel was never created.
+            }
+            val existing = manager.getNotificationChannel(INCOMING_CHANNEL_ID)
+            if (existing == null || existing.importance < NotificationManager.IMPORTANCE_HIGH) {
+                val channel = NotificationChannel(
+                    INCOMING_CHANNEL_ID,
+                    "Incoming Transfer Requests",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    description = "High-priority alerts when a peer asks to send files"
+                    enableVibration(true)
+                    setSound(
+                        RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION),
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build()
+                    )
+                    setShowBadge(true)
+                }
+                manager.createNotificationChannel(channel)
+            }
+        }
+
+        val launchIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        val contentIntent = PendingIntent.getActivity(context, 41, launchIntent, pendingFlags)
+
+        val acceptIntent = Intent(context, IncomingTransferActionReceiver::class.java).apply {
+            action = ACTION_ACCEPT_TRANSFER
+            putExtra(EXTRA_TRANSFER_ID, transferId)
+            putExtra(EXTRA_ACCEPT_TRANSFER, true)
+        }
+        val declineIntent = Intent(context, IncomingTransferActionReceiver::class.java).apply {
+            action = ACTION_DECLINE_TRANSFER
+            putExtra(EXTRA_TRANSFER_ID, transferId)
+            putExtra(EXTRA_ACCEPT_TRANSFER, false)
+        }
+        val actionFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        val acceptPendingIntent = PendingIntent.getBroadcast(
+            context,
+            REQUEST_CODE_ACCEPT,
+            acceptIntent,
+            actionFlags
+        )
+        val declinePendingIntent = PendingIntent.getBroadcast(
+            context,
+            REQUEST_CODE_DECLINE,
+            declineIntent,
+            actionFlags
+        )
+        val largeIcon = BitmapFactory.decodeResource(context.resources, R.mipmap.ic_launcher)
+
+        val notification = NotificationCompat.Builder(context, INCOMING_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_qs_beamdrop)
+            .apply {
+                if (largeIcon != null) {
+                    setLargeIcon(largeIcon)
+                }
+            }
+            .setContentTitle(title)
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .setAutoCancel(true)
+            .setTimeoutAfter(60_000L)
+            .setContentIntent(contentIntent)
+            .addAction(0, "Accept", acceptPendingIntent)
+            .addAction(0, "Decline", declinePendingIntent)
+            .build()
+
+        try {
+            manager.notify(INCOMING_NOTIFICATION_ID, notification)
+        } catch (_: SecurityException) {
+            // Permission revoked mid-flight.
+        }
+    }
+
+    @JvmStatic
+    fun dismissIncomingTransferNotification(context: Context) {
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        manager.cancel(INCOMING_NOTIFICATION_ID)
+    }
+
+    @JvmStatic
     external fun nativeQueueSharedPaths(paths: Array<String>)
 
     @JvmStatic
     external fun nativeQueueTargetedSend(targetNodeId: String, paths: Array<String>)
 
     @JvmStatic
+    fun respondFromNotification(transferId: String, accept: Boolean) {
+        if (transferId.isBlank() || !rustReady) return
+        try {
+            nativeRespondToOffer(transferId, accept)
+        } catch (_: UnsatisfiedLinkError) {
+            // Native library not initialized yet.
+        }
+    }
+
+    @JvmStatic
     external fun nativeQueuePairingUri(uri: String)
+
+    @JvmStatic
+    external fun nativeRespondToOffer(transferId: String, accept: Boolean)
 
     @JvmStatic
     external fun nativeGetTrustedPeersJson(): String

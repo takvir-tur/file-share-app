@@ -8,10 +8,12 @@ interface PairDeviceModalProps {
   open: boolean;
   session: PairingSession | null;
   peers: PeerEntry[];
+  initialTarget: string | null;
   busy: boolean;
   errorMessage: string | null;
   onClose: () => void;
-  onRefreshSession: () => void;
+  onEnsureSession: () => void;
+  onRegenerateSession: () => void;
   onPairSubmit: (target: string, pin: string) => Promise<void>;
   onRemoveTrusted: (nodeId: string) => Promise<void>;
 }
@@ -52,10 +54,12 @@ export function PairDeviceModal({
   open,
   session,
   peers,
+  initialTarget,
   busy,
   errorMessage,
   onClose,
-  onRefreshSession,
+  onEnsureSession,
+  onRegenerateSession,
   onPairSubmit,
   onRemoveTrusted,
 }: PairDeviceModalProps) {
@@ -70,13 +74,32 @@ export function PairDeviceModal({
   const [target, setTarget] = useState("");
   const [pin, setPin] = useState("");
   const [err, setErr] = useState<string | null>(null);
+  const [nowSec, setNowSec] = useState(() => Math.floor(Date.now() / 1000));
 
   useEffect(() => {
     if (open) {
       setErr(null);
-      if (!session) onRefreshSession();
+      if (initialTarget) {
+        setTarget(initialTarget);
+        setTab("enter");
+      } else {
+        setTab("show");
+      }
+      onEnsureSession();
     }
-  }, [open, session, onRefreshSession]);
+  }, [initialTarget, open, onEnsureSession]);
+
+  useEffect(() => {
+    if (!open || !session) return;
+    setNowSec(Math.floor(Date.now() / 1000));
+    const timer = window.setInterval(() => {
+      setNowSec(Math.floor(Date.now() / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [open, session?.expiresAtUnix]);
+
+  const remainingSecs = session ? Math.max(0, session.expiresAtUnix - nowSec) : 0;
+  const countdownText = `${Math.floor(remainingSecs / 60)}:${String(remainingSecs % 60).padStart(2, "0")}`;
 
   const onTabKey = (e: KeyboardEvent<HTMLDivElement>) => {
     if (["ArrowRight", "ArrowLeft", "Home", "End"].includes(e.key)) {
@@ -89,17 +112,15 @@ export function PairDeviceModal({
 
   const onTargetChange = (val: string) => {
     setTarget(val);
-    if (!pin) {
-      const m = /[?&]pin=(\d{6})\b/.exec(val);
-      if (m) setPin(m[1]);
-    }
+    const m = /[?&]pin=(\d{6})\b/.exec(val);
+    if (m) setPin(m[1]);
   };
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     const t = target.trim();
     const p = pin.trim();
-    if (!t) return setErr("Enter IP:port, NodeId, or pairing URI.");
+    if (!t) return setErr("Enter an address, Device ID, or pairing link.");
     if (!t.startsWith("beamdrop://") && !/^\d{6}$/.test(p)) {
       return setErr("Enter the 6-digit PIN.");
     }
@@ -112,7 +133,7 @@ export function PairDeviceModal({
   const online = peers.filter((p) => p.online);
   const tabList: ["show" | "enter", string, typeof showRef, string][] = [
     ["show", showId, showRef, "Show My Code"],
-    ["enter", enterId, enterRef, `Enter PIN (${trusted.length} trusted)`],
+    ["enter", enterId, enterRef, `Enter Code (${trusted.length} saved)`],
   ];
 
   return (
@@ -127,7 +148,7 @@ export function PairDeviceModal({
           </form>
         </header>
 
-        <div role="tablist" aria-label="Pairing modes" className="tabs" onKeyDown={onTabKey}>
+        <div role="tablist" aria-label="Pairing options" className="tabs" onKeyDown={onTabKey}>
           {tabList.map(([key, id, ref, label]) => (
             <button
               key={key}
@@ -160,17 +181,22 @@ export function PairDeviceModal({
                   </div>
                   <div className="panel-box sb">
                     <code className="mono uri">{session.uri}</code>
-                    <CopyButton value={session.uri} label="Copy pairing URI" />
+                    <CopyButton value={session.uri} label="Copy pairing link" />
                   </div>
                   <div className="sb">
-                    <span className="mu">LAN: {session.addr}</span>
-                    <button type="button" className="btn bs sm" onClick={onRefreshSession} disabled={busy}>
+                    <span className="mu">Same Wi-Fi: {session.addr}</span>
+                    <button type="button" className="btn bs sm" onClick={onRegenerateSession} disabled={busy}>
                       New Code
                     </button>
                   </div>
+                  <div className="mu xs">
+                    {remainingSecs > 0
+                      ? `Internet pairing active · Expires in ${countdownText}`
+                      : "Code expired — click New Code"}
+                  </div>
                 </>
               ) : (
-                <div className="mu">Generating pairing session...</div>
+                <div className="mu">Creating pairing code...</div>
               )}
             </div>
           )}
@@ -181,7 +207,7 @@ export function PairDeviceModal({
             <div className="stack">
               {online.length > 0 && (
                 <div>
-                  <div className="lbl">Online Devices</div>
+                  <div className="lbl">Nearby Online</div>
                   <div className="row mt4">
                     {online.map((peer) => (
                       <button
@@ -200,28 +226,44 @@ export function PairDeviceModal({
 
               <form onSubmit={(e) => void submit(e)} className="stack">
                 <label className="fld">
-                  <span className="lbl">Target (IP:port, NodeId, or beamdrop:// URI)</span>
-                  <input type="text" placeholder="192.168.1.42:51820 or beamdrop://pair?..." value={target} onChange={(e) => onTargetChange(e.target.value)} autoComplete="off" />
+                  <span className="lbl">Address, Device ID, or Pairing Link</span>
+                  <input
+                    type="text"
+                    placeholder="192.168.1.42:51820 or beamdrop://pair?..."
+                    value={target}
+                    onChange={(e) => onTargetChange(e.target.value)}
+                    autoComplete="off"
+                  />
                 </label>
                 <label className="fld">
                   <span className="lbl">6-Digit PIN</span>
-                  <input type="text" inputMode="numeric" maxLength={6} placeholder="123456" value={pin} onChange={(e) => setPin(e.target.value.replace(/\D/g, "").slice(0, 6))} className="pin-in" />
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={6}
+                    placeholder="123456"
+                    value={pin}
+                    onChange={(e) => setPin(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                    className="pin-in"
+                  />
                 </label>
                 {(err || errorMessage) && <p className="err" role="alert">{err ?? errorMessage}</p>}
-                <button type="submit" className="btn bp" disabled={busy}>{busy ? "Pairing..." : "Complete Pairing"}</button>
+                <button type="submit" className="btn bp" disabled={busy}>
+                  {busy ? "Pairing..." : "Pair Device"}
+                </button>
               </form>
 
               <div className="sep-top stack">
-                <h3 className="m0 xs fw6">Trusted Devices ({trusted.length})</h3>
+                <h3 className="m0 xs fw6">Saved Devices ({trusted.length})</h3>
                 {trusted.length === 0 ? (
-                  <p className="mu m0">No trusted devices saved yet.</p>
+                  <p className="mu m0">No saved devices yet.</p>
                 ) : (
                   <ul className="list">
                     {trusted.map((peer) => (
                       <li key={peer.nodeId} className="item sb">
                         <div className="row g8 min0">
                           <OsIcon osType={peer.osType} size={16} />
-                          <div>
+                          <div className="min0">
                             <div className="row xs fw6">
                               <span>{peer.displayName}</span>
                               <ShieldIcon size={13} className="ok" />
@@ -229,8 +271,13 @@ export function PairDeviceModal({
                             <div className="mono mu">{shortNodeId(peer.nodeId)}</div>
                           </div>
                         </div>
-                        <button type="button" className="btn bdn sm" disabled={busy} onClick={() => void onRemoveTrusted(peer.nodeId)}>
-                          Remove Trust
+                        <button
+                          type="button"
+                          className="btn btn-danger-ghost sm"
+                          disabled={busy}
+                          onClick={() => void onRemoveTrusted(peer.nodeId)}
+                        >
+                          Remove
                         </button>
                       </li>
                     ))}

@@ -18,6 +18,7 @@ use tauri_plugin_autostart::MacosLauncher;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    beamdrop_core::raise_open_file_limit();
     #[cfg(desktop)]
     let (
         initial_send_paths,
@@ -34,10 +35,13 @@ pub fn run() {
             parsed.launched_minimized,
         )
     };
-    #[cfg(all(not(desktop), not(target_os = "android")))]
+    #[cfg(not(desktop))]
     let initial_send_paths: Vec<String> = Vec::new();
 
+    let app_state = commands::AppState::new(initial_send_paths.clone());
+
     let builder = tauri::Builder::default()
+        .manage(app_state.clone())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init());
@@ -79,21 +83,23 @@ pub fn run() {
             }
         });
 
+    let setup_state = app_state.clone();
     builder
         .setup(move |app| {
+            let state = setup_state.clone();
             #[cfg(target_os = "android")]
-            let (node_config, initial_send_paths) = {
+            let node_config = {
                 let config_dir = app.path().app_config_dir()?;
                 std::fs::create_dir_all(&config_dir)?;
                 android::set_config_dir(config_dir.clone());
                 let app_local_data = app.path().app_local_data_dir().ok();
                 let dl_dirs = android::resolve_download_dirs(app_local_data);
-                let cfg = NodeConfig {
+                state.queue_send_paths(android::take_initial_shared_paths());
+                NodeConfig {
                     config_dir: Some(config_dir),
                     download_dir: Some(dl_dirs.engine_dir),
                     ..NodeConfig::default()
-                };
-                (cfg, android::take_initial_shared_paths())
+                }
             };
             #[cfg(not(target_os = "android"))]
             let node_config = NodeConfig::default();
@@ -103,18 +109,11 @@ pub fn run() {
                 || initial_targeted_send.is_some()
                 || !initial_pairing_uris.is_empty();
 
-            let node = tauri::async_runtime::block_on(async {
-                BeamDropNode::start(node_config).await
-            })?;
-            let state = commands::AppState::new(Arc::new(node), initial_send_paths);
-
             #[cfg(desktop)]
             for uri in initial_pairing_uris {
                 state.queue_pairing_uri(uri);
             }
 
-            app.manage(state.clone());
-            commands::spawn_event_forwarder(app.handle().clone(), state.clone());
             #[cfg(target_os = "android")]
             android::bind_app_handle(app.handle().clone());
 
@@ -128,10 +127,26 @@ pub fn run() {
             }
 
             {
-                let sync_app = app.handle().clone();
-                let sync_node = Arc::clone(&state.node);
+                let startup_app = app.handle().clone();
+                let startup_state = state.clone();
                 tauri::async_runtime::spawn(async move {
-                    commands::sync_platform_trust_targets(&sync_app, &sync_node).await;
+                    match BeamDropNode::start(node_config).await {
+                        Ok(node) => {
+                            let node = Arc::new(node);
+                            startup_state.set_node(Arc::clone(&node)).await;
+                            commands::spawn_event_forwarder(
+                                startup_app.clone(),
+                                startup_state.clone(),
+                                Arc::clone(&node),
+                            );
+                            commands::sync_platform_trust_targets(&startup_app, &node).await;
+                            #[cfg(desktop)]
+                            tray::refresh_tray_menu(&startup_app).await;
+                        }
+                        Err(err) => {
+                            startup_state.set_startup_error(err.to_string()).await;
+                        }
+                    }
                 });
             }
 
@@ -152,14 +167,18 @@ pub fn run() {
             commands::list_peers,
             commands::refresh_peers,
             commands::start_pairing,
+            commands::regenerate_pairing,
+            commands::cancel_pairing,
             commands::parse_pairing_uri,
             commands::pair_with_peer,
             commands::remove_trusted_peer,
             commands::set_peer_wan_enabled,
+            commands::set_peer_auto_accept,
             commands::is_on_metered_cellular,
             commands::measure_paths_bytes,
             commands::send_paths,
             commands::respond_to_offer,
+            commands::open_main_window,
             commands::pause_transfer,
             commands::resume_transfer,
             commands::cancel_transfer,
@@ -172,7 +191,7 @@ pub fn run() {
             commands::fix_windows_firewall,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building BeamDrop Tauri application")
+        .expect("error while building ZapDrop Tauri application")
         .run(|_app, _event| {
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = _event {
@@ -181,8 +200,12 @@ pub fn run() {
                 for url in urls {
                     let s = url.as_str();
                     if s.to_ascii_lowercase().starts_with("beamdrop://") {
-                        state.queue_pairing_uri(s.to_string());
-                        let _ = _app.emit(commands::EVENT_PAIR_URI, s);
+                        if let Some(send_paths) = commands::parse_send_uri(s) {
+                            file_paths.extend(send_paths);
+                        } else {
+                            state.queue_pairing_uri(s.to_string());
+                            let _ = _app.emit(commands::EVENT_PAIR_URI, s);
+                        }
                     } else if url.scheme() == "file" {
                         if let Ok(path) = url.to_file_path() {
                             file_paths.push(path.to_string_lossy().into_owned());

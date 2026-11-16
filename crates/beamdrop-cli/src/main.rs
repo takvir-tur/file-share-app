@@ -221,7 +221,7 @@ async fn run_daemon(
                             peer.display_name,
                             peer.os_type,
                             peer.node_id,
-                            peer.addr
+                            peer.addr.map_or_else(|| "WAN".to_string(), |a| a.to_string())
                         );
                     }
                     Ok(PeerEvent::Lost(peer)) => {
@@ -230,7 +230,7 @@ async fn run_daemon(
                             peer.display_name,
                             peer.os_type,
                             peer.node_id,
-                            peer.addr
+                            peer.addr.map_or_else(|| "WAN".to_string(), |a| a.to_string())
                         );
                     }
                     Ok(PeerEvent::Paired(peer)) => {
@@ -266,12 +266,27 @@ async fn run_daemon(
                             total_bytes as f64 / (1024.0 * 1024.0)
                         );
                     }
-                    Ok(TransferEvent::PendingApproval { transfer_id, sender_node_id, sender_name, files, total_bytes }) => {
+                    Ok(TransferEvent::PendingApproval { transfer_id, sender_node_id, sender_name, file_name, files, total_bytes, is_wan, .. }) => {
+                        let via = if is_wan { "WAN" } else { "LAN" };
                         println!(
-                            "[PENDING APPROVAL] {} | Untrusted peer: {} ({}) | {} file(s) ({:.2} MB) | Held up to 60s before rejection",
+                            "[PENDING APPROVAL] {} | {} | Peer: {} ({}) | {} ({} file(s), {:.2} MB) | Held up to 60s before rejection",
                             transfer_id,
+                            via,
                             sender_name,
                             sender_node_id,
+                            file_name,
+                            files,
+                            total_bytes as f64 / (1024.0 * 1024.0)
+                        );
+                    }
+                    Ok(TransferEvent::AwaitingApproval { transfer_id, peer_name, file_name, files, total_bytes, is_wan, .. }) => {
+                        let via = if is_wan { "WAN" } else { "LAN" };
+                        println!(
+                            "[AWAITING APPROVAL] {} | {} | Receiver: {} | {} ({} file(s), {:.2} MB)",
+                            transfer_id,
+                            via,
+                            peer_name,
+                            file_name,
                             files,
                             total_bytes as f64 / (1024.0 * 1024.0)
                         );
@@ -304,6 +319,12 @@ async fn run_daemon(
                     }
                     Ok(TransferEvent::Interrupted { transfer_id, reason }) => {
                         println!("[TRANSFER INTERRUPTED] {} | {}", transfer_id, reason);
+                    }
+                    Ok(TransferEvent::Failed { transfer_id, peer_name, file_name, reason, .. }) => {
+                        println!(
+                            "[TRANSFER FAILED] {} | Peer: {} | Item: {} | {}",
+                            transfer_id, peer_name, file_name, reason
+                        );
                     }
                     Ok(TransferEvent::Progress(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -390,7 +411,7 @@ async fn run_peers(
             let status = if peer.online { "ONLINE" } else { "CACHED" };
             println!(
                 "  - [{status}] {} ({}) | NodeId: {} | SocketAddr: {}",
-                peer.display_name, peer.os_type, peer.node_id, peer.addr
+                peer.display_name, peer.os_type, peer.node_id, peer.addr.map_or_else(|| "WAN".to_string(), |a| a.to_string())
             );
         }
     }
@@ -434,7 +455,7 @@ async fn run_send(
 
     println!(
         "Connected target: {} ({}) | NodeId: {} | Addr: {}",
-        peer.display_name, peer.os_type, peer.node_id, peer.addr
+        peer.display_name, peer.os_type, peer.node_id, peer.addr.map_or_else(|| "WAN".to_string(), |a| a.to_string())
     );
 
     let (progress_tx, mut progress_rx) = mpsc::channel::<TransferProgress>(64);
@@ -836,7 +857,7 @@ async fn print_peer_event(node: &BeamDropNode, event: PeerEvent, verify_ping: bo
                             peer.display_name,
                             peer.os_type,
                             peer.node_id,
-                            peer.addr,
+                            peer.addr.map_or_else(|| "WAN".to_string(), |a| a.to_string()),
                             dial_start.elapsed(),
                             rtt
                         );
@@ -844,14 +865,14 @@ async fn print_peer_event(node: &BeamDropNode, event: PeerEvent, verify_ping: bo
                     Err(_) => {
                         println!(
                             "[DISCOVERED] {} ({}) | NodeId: {} | Addr: {}",
-                            peer.display_name, peer.os_type, peer.node_id, peer.addr
+                            peer.display_name, peer.os_type, peer.node_id, peer.addr.map_or_else(|| "WAN".to_string(), |a| a.to_string())
                         );
                     }
                 }
             } else {
                 println!(
                     "[DISCOVERED] {} ({}) | NodeId: {} | Addr: {}",
-                    peer.display_name, peer.os_type, peer.node_id, peer.addr
+                    peer.display_name, peer.os_type, peer.node_id, peer.addr.map_or_else(|| "WAN".to_string(), |a| a.to_string())
                 );
             }
         }
@@ -864,7 +885,10 @@ async fn print_peer_event(node: &BeamDropNode, event: PeerEvent, verify_ping: bo
         }) => {
             println!(
                 "[LOST]       {} ({}) | NodeId: {} | Last Addr: {}",
-                display_name, os_type, node_id, addr
+                display_name,
+                os_type,
+                node_id,
+                addr.map_or_else(|| "WAN".to_string(), |a| a.to_string())
             );
         }
         PeerEvent::Paired(peer) => {
